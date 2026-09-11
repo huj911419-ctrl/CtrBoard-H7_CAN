@@ -1,0 +1,31 @@
+# Build output
+build/
+
+# IDE files
+.vscode/
+.settings/
+MDK-ARM/
+
+# CubeMX internal
+.mxproject
+.merkle-snapshot.json
+mx.scratch
+CtrBoard-H7_FDCAN.ioc
+
+# Editor
+.clangd
+
+# Duplicate startup file (real one in MDK-ARM)
+startup_stm32h723xx.s
+
+# Compiled objects
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+*.a
+*.out
+*.crf
+*.d
