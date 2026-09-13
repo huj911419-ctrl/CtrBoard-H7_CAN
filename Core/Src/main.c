@@ -59,6 +59,20 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 uint8_t tx_data[8] = {0,1,2,3,4,5,6,7};
+
+/* MIT协议定点映射（PMAX/VMAX/TMAX=12.5/30/10，与上位机读到的保持一致） */
+#define MOTOR_ID   0x000
+#define PMAX_F     12.5f
+#define VMAX_F     30.0f
+#define TMAX_F     10.0f
+static int f2u(float x, float lo, float hi, int bits)
+{
+	return (int)((x - lo) * (float)((1 << bits) - 1) / (hi - lo));
+}
+static float u2f(uint32_t x, float lo, float hi, int bits)
+{
+	return (float)x * (hi - lo) / (float)((1 << bits) - 1) + lo;
+}
 /* USER CODE END 0 */
 
 /**
@@ -103,38 +117,94 @@ int main(void)
   MX_FDCAN3_Init();
   MX_USART10_UART_Init();
   /* USER CODE BEGIN 2 */
-	/* ===== 实验一：FDCAN1 内部环回模式 =====
-	 * 环回 = 发出的帧在芯片内部直接送回接收通道，不需要任何外部设备，
-	 * 用来打通"发送→TX FIFO→总线位流→RX FIFO→中断→回调→串口打印"全链路。
-	 * 接电机时：把下面 hfdcan1 那两行注释掉、重新编译烧录即恢复正常模式。
-	 * 注意：改 Mode 必须发生在 HAL_FDCAN_Start()（bsp_can_init 里）之前，
-	 * 所以这里用新 Mode 重新 Init 一次；写在 USER CODE 区是为了
-	 * CubeMX 重新生成代码时不丢。 */
-	hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
-	if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	bsp_can_init();
+	/* ===== 普通模式：给电机口上电并发使能帧 =====
+	 * 电机口电源由PMOS控制：上口OUT1(FDCAN1)=PC14，下口OUT2(FDCAN2)=PC13，
+	 * 对外5V=PC15。V1.0原理图与V1.1管脚标注图对PC13/PC15标注有修订，
+	 * 三个都拉高最稳妥：电机口必然有电，5V轨开启也无副作用。 */
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+	GPIO_InitTypeDef pwr_gpio = {0};
+	pwr_gpio.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+	pwr_gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+	pwr_gpio.Pull  = GPIO_NOPULL;
+	pwr_gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOC, &pwr_gpio);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET);
 
-	log_print("\r\n=== CAN loopback test: FDCAN1 @1Mbps classic ===\r\n");
+	HAL_Delay(2000);            /* 等电机上电自检完成（红灯常亮=失能，正常） */
+	bsp_can_init();             /* 三路FDCAN启动，1Mbps经典CAN */
+	HAL_Delay(100);
+
+	log_print("\r\n=== DM-J4310-2EC ID scan & enable (CAN1, 1Mbps classic) ===\r\n");
+	log_print("流程: 扫描0x00~0x7F找电机真实ID -> 清错误 -> 使能 -> 轮询\r\n");
+	log_print("观察电机灯: 常亮红=失能正常 绿=使能成功 闪烁红=有故障码(看[PARAM])\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-		/* 只用 FDCAN1 做实验：每帧把第1字节+1，串口里能看出帧在变化。
-		 * fdcanx_send_data 只是把帧塞进 TX FIFO（异步），立刻返回：
-		 * 0=成功入队，1=FIFO满/失败 —— 顺便观察 CAN 发送是异步的这个事实 */
-		//tx_data[0]++;
-		uint8_t ret = fdcanx_send_data(&hfdcan1, 0x520, tx_data, 8);
-		can_log("TX", 0x520, tx_data);
-		if (ret != 0)
+  /* ===== 安全保持模式：使能 + 100Hz零扭矩 + 遥测解码 =====
+   * 已破案：电机ID=0x000，曾被故障闩死；FF×7+FB/FC 全填充格式有效。
+   * 本循环每10ms发一帧MIT零扭矩（kp=kd=0、t_ff=0且按映射编码到0x7FF，
+   * 注意MIT帧全零字节≠零扭矩，t_ff原始0会映射成-10Nm！），这同时
+   * 触发电机每帧回反馈 → 解码出位置/速度/扭矩/双温度打印。 */
+	/* MIT零扭矩帧：p=0 v=0 kp=0 kd=0 t_ff=0（t_ff编码值2047=0x7FF） */
+	uint8_t mit0[8];
+	int pi = f2u(0, -PMAX_F, PMAX_F, 16);   /* 32768 */
+	int vi = f2u(0, -VMAX_F, VMAX_F, 12);   /* 2048  */
+	int ti = f2u(0, -TMAX_F, TMAX_F, 12);   /* 2047  */
+	mit0[0] = pi >> 8;  mit0[1] = pi & 0xFF;
+	mit0[2] = vi >> 4;
+	mit0[3] = (vi & 0xF) << 4;              /* kp高4位=0 */
+	mit0[4] = 0;                            /* kp低8位   */
+	mit0[5] = 0;                            /* kd[11:4]  */
+	mit0[6] = (uint8_t)((0 & 0xF) << 4 | (ti >> 8));  /* kd[3:0]=0, t_ff[11:8] */
+	mit0[7] = (uint8_t)(ti & 0xFF);         /* t_ff[7:0]  */
+	/* 上电顺序：先失能(停掉一切残余动作) -> 再使能 */
+	uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+	fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
+	log_print("[SAFE] 已发失能帧，清除残余动作\r\n");
+	HAL_Delay(200);
+	uint8_t en[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
+	fdcanx_send_data(&hfdcan1, MOTOR_ID, en, 8);
+	log_print("[EN] 电机ID=0x%03X 已使能，进入零扭矩保持（绿灯应常亮，轴可用手转动）\r\n",
+	          MOTOR_ID);
+
+	while (1)
+	{
+		/* 100Hz零扭矩命令：维持使能状态 + 触发反馈帧 */
+		fdcanx_send_data(&hfdcan1, MOTOR_ID, mit0, 8);
+
+		/* 解码最新反馈帧（ERR/位置/速度/扭矩/双温度），2Hz打印 */
+		static uint32_t last_print = 0;
+		if (dm_fb_new && (HAL_GetTick() - last_print) >= 500)
 		{
-			log_print("[TX] FAILED ret=%d (TX FIFO full?)\r\n", ret);
+			dm_fb_new = 0;
+			last_print = HAL_GetTick();
+			uint8_t err = dm_fb[0] >> 4;
+			int  pos_raw = (dm_fb[1] << 8) | dm_fb[2];
+			int  vel_raw = ((dm_fb[3] & 0xFF) << 4) | (dm_fb[4] >> 4);
+			int  tau_raw = ((dm_fb[4] & 0x0F) << 8) | dm_fb[5];
+			float pos = u2f(pos_raw, -PMAX_F, PMAX_F, 16);
+			float vel = u2f(vel_raw, -VMAX_F, VMAX_F, 12);
+			float tau = u2f(tau_raw, -TMAX_F, TMAX_F, 12);
+			const char *err_s =
+				(err == 0) ? "失能" : (err == 1) ? "使能" :
+				(err == 3) ? "输出轴校准异常" : (err == 4) ? "传感器输出异常" :
+				(err == 5) ? "电机编码器校准异常" : (err == 8) ? "超压" :
+				(err == 9) ? "欠压" : (err == 0xA) ? "过流" :
+				(err == 0xB) ? "MOS过温" : (err == 0xC) ? "线圈过温" :
+				(err == 0xD) ? "通讯丢失" : (err == 0xE) ? "过载" : "未知";
+			float ap = (pos < 0) ? -pos : pos;
+			float av = (vel < 0) ? -vel : vel;
+			float at = (tau < 0) ? -tau : tau;
+			log_print("[FB] ERR=%X(%s) pos=%s%lu.%02lurad spd=%s%lu.%02lurad/s "
+			          "tau=%s%lu.%02luNm T_MOS=%uC T_Rotor=%uC\r\n",
+			          err, err_s,
+			          (pos < 0) ? "-" : "", (unsigned long)ap, (unsigned long)((ap - (int)ap) * 100),
+			          (vel < 0) ? "-" : "", (unsigned long)av, (unsigned long)((av - (int)av) * 100),
+			          (tau < 0) ? "-" : "", (unsigned long)at, (unsigned long)((at - (int)at) * 100),
+			          dm_fb[6], dm_fb[7]);
 		}
-		HAL_Delay(500);
+		HAL_Delay(10);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -220,13 +290,14 @@ void log_print(const char *fmt, ...)
 }
 
 /* 把一帧 CAN 打印成一行，例如：
- * [TX] ID=0x520  07 01 02 03 04 05 06 07 */
-void can_log(const char *tag, uint16_t id, const uint8_t *data)
+ * [TX|CAN1] ID=0x000  FF FC 00 00 00 00 00 00
+ * len 为实际字节数（DLC），发几字节打几字节 */
+void can_log(const char *dir, const char *port, uint16_t id, const uint8_t *data, uint8_t len)
 {
-	log_print("[%s] ID=0x%03X  %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-	          tag, id,
-	          data[0], data[1], data[2], data[3],
-	          data[4], data[5], data[6], data[7]);
+	log_print("[%s|%s] ID=0x%03X ", dir, port, id);
+	for (uint8_t i = 0; i < len && i < 8; i++)
+		log_print("%02X ", data[i]);
+	log_print("\r\n");
 }
 /* USER CODE END 4 */
 

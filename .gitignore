@@ -18,6 +18,9 @@ CtrBoard-H7_FDCAN.ioc
 # Duplicate startup file (real one in MDK-ARM)
 startup_stm32h723xx.s
 
+# Scratch (local issues, not tracked)
+.scratch/
+
 # Compiled objects
 *.o
 *.obj

@@ -54,7 +54,7 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 void log_print(const char *fmt, ...);
-void can_log(const char *tag, uint16_t id, const uint8_t *data);
+void can_log(const char *dir, const char *port, uint16_t id, const uint8_t *data, uint8_t len);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
