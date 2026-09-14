@@ -146,18 +146,44 @@ int main(void)
    * 本循环每10ms发一帧MIT零扭矩（kp=kd=0、t_ff=0且按映射编码到0x7FF，
    * 注意MIT帧全零字节≠零扭矩，t_ff原始0会映射成-10Nm！），这同时
    * 触发电机每帧回反馈 → 解码出位置/速度/扭矩/双温度打印。 */
-	/* MIT零扭矩帧：p=0 v=0 kp=0 kd=0 t_ff=0（t_ff编码值2047=0x7FF） */
+	/* MIT速度控制帧：p=0，v=1.0rad/s，kp=0，kd=0.5，t_ff=0
+	 * 按达妙说明书：kp=0、kd!=0、给定v_des可实现匀速转动。 */
 	uint8_t mit0[8];
-	int pi = f2u(0, -PMAX_F, PMAX_F, 16);   /* 32768 */
-	int vi = f2u(0, -VMAX_F, VMAX_F, 12);   /* 2048  */
-	int ti = f2u(0, -TMAX_F, TMAX_F, 12);   /* 2047  */
+	int pi = f2u(0.0f, -PMAX_F, PMAX_F, 16);   /* 位置给定：0 */
+	int vi = f2u(1.0f, -VMAX_F, VMAX_F, 12);   /* 速度给定：1.0 rad/s */
+	int kpi = f2u(0.0f, 0.0f, 100.0f, 12);    /* kp=0：速度控制 */
+	int kdi = f2u(0.5f, 0.0f, 20.0f, 12);     /* kd=0.5：保持非0 */
+	int ti = f2u(0.0f, -TMAX_F, TMAX_F, 12);   /* t_ff=0：零力矩前馈 */
 	mit0[0] = pi >> 8;  mit0[1] = pi & 0xFF;
 	mit0[2] = vi >> 4;
-	mit0[3] = (vi & 0xF) << 4;              /* kp高4位=0 */
-	mit0[4] = 0;                            /* kp低8位   */
-	mit0[5] = 0;                            /* kd[11:4]  */
-	mit0[6] = (uint8_t)((0 & 0xF) << 4 | (ti >> 8));  /* kd[3:0]=0, t_ff[11:8] */
-	mit0[7] = (uint8_t)(ti & 0xFF);         /* t_ff[7:0]  */
+	mit0[3] = (vi & 0xF) << 4 | (kpi >> 8); /* kp高4位 */
+	mit0[4] = kpi & 0xFF;                   /* kp低8位 */
+	mit0[5] = kdi >> 4;                     /* kd[11:4] */
+	mit0[6] = (uint8_t)((kdi & 0xF) << 4 | (ti >> 8)); /* kd[3:0], t_ff[11:8] */
+	mit0[7] = (uint8_t)(ti & 0xFF);         /* t_ff[7:0] */
+	/* ===== 重新扫描电机真实 CAN ID（0x00~0x7F）=====
+	 * 格式/供电/物理层均已确认正确，唯一能解释"读参数无应答+使能无效+反馈全0"
+	 * 的就是 CAN ID 不匹配。逐个候选ID发读参数帧读VBus(0x3C)，能收到0x33应答者
+	 * 即真实ID（应答帧D0/D1回显电机ID，见 dm_reply_canid）。 */
+	can_tx_quiet = 1;
+	uint8_t scanrd[4] = {0, 0, 0x33, 0x3C};
+	uint16_t found_id = 0xFFFF;
+	for (uint16_t cand = 0; cand <= 0x7F; cand++)
+	{
+		dm_rx33_flag = 0;
+		scanrd[0] = (uint8_t)(cand & 0xFF);
+		scanrd[1] = (uint8_t)(cand >> 8);
+		fdcanx_send_data(&hfdcan1, 0x7FF, scanrd, 4);
+		HAL_Delay(10);
+		if (dm_rx33_flag) { found_id = cand; break; }
+	}
+	can_tx_quiet = 0;
+	if (found_id != 0xFFFF)
+		log_print("[SCAN] 命中电机真实ID=0x%03X（应答回显=0x%03X）\r\n",
+		          found_id, dm_reply_canid);
+	else
+		log_print("[SCAN] 0x00~0x7F 全无0x33应答（电机不在线 or MasterID≠0x10 or 读参数走不通）\r\n");
+
 	/* 上电顺序：先失能(停掉一切残余动作) -> 再使能 */
 	uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
 	fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
@@ -168,10 +194,35 @@ int main(void)
 	log_print("[EN] 电机ID=0x%03X 已使能，进入零扭矩保持（绿灯应常亮，轴可用手转动）\r\n",
 	          MOTOR_ID);
 
+	/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
+	 * 手册读参数帧只有4字节(D0=CANID_L,D1=CANID_H,D2=0x33,D3=RID)，发8字节DLC不匹配电机不响应 */
+	uint8_t rd[4] = {0, 0, 0x33, 0};
+	uint8_t rids[] = {0x10, 0x3C, 0x3E};  /* NPP极对数(应=14)/VBus电压/Tmtr线圈温度 */
+	for (uint8_t i = 0; i < sizeof(rids); i++)
+	{
+		rd[3] = rids[i];
+		fdcanx_send_data(&hfdcan1, 0x7FF, rd, 4);
+		HAL_Delay(80);   /* 等应答帧(问询式，发一帧回一帧) */
+	}
+
 	while (1)
 	{
 		/* 100Hz零扭矩命令：维持使能状态 + 触发反馈帧 */
 		fdcanx_send_data(&hfdcan1, MOTOR_ID, mit0, 8);
+
+		/* 每秒打印帧计数：看ID=0x10帧是"每MIT帧都回(~100/s)"还是"只来一次" */
+		static uint32_t last_cnt = 0, prev_rx = 0, prev_fb = 0;
+		if ((HAL_GetTick() - last_cnt) >= 1000)
+		{
+			uint32_t drx = dm_rx_count - prev_rx;
+			uint32_t dfb = dm_fb_count - prev_fb;
+			prev_rx = dm_rx_count;
+			prev_fb = dm_fb_count;
+			last_cnt = HAL_GetTick();
+			log_print("[CNT] rx_total=%lu(+%lu/s) fb_0x10=%lu(+%lu/s)\r\n",
+			          (unsigned long)dm_rx_count, (unsigned long)drx,
+			          (unsigned long)dm_fb_count, (unsigned long)dfb);
+		}
 
 		/* 解码最新反馈帧（ERR/位置/速度/扭矩/双温度），2Hz打印 */
 		static uint32_t last_print = 0;
@@ -179,6 +230,9 @@ int main(void)
 		{
 			dm_fb_new = 0;
 			last_print = HAL_GetTick();
+			log_print("[RAW FB] %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+			          dm_fb[0], dm_fb[1], dm_fb[2], dm_fb[3],
+			          dm_fb[4], dm_fb[5], dm_fb[6], dm_fb[7]);
 			uint8_t err = dm_fb[0] >> 4;
 			int  pos_raw = (dm_fb[1] << 8) | dm_fb[2];
 			int  vel_raw = ((dm_fb[3] & 0xFF) << 4) | (dm_fb[4] >> 4);

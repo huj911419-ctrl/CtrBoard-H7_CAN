@@ -114,18 +114,19 @@ uint8_t fdcanx_receive(hcan_t *hfdcan, uint16_t *rec_id, uint8_t *buf)
 	if(HAL_FDCAN_GetRxMessage(hfdcan,FDCAN_RX_FIFO0, &pRxHeader, buf)==HAL_OK)
 	{
 		*rec_id = pRxHeader.Identifier;
-		/* 原版此处用一串 if(DataLength<=...) 连环赋值，条件全部成立，
-		 * 任何帧最后都返回64——已修正为互斥判断。
-		 * HAL的DataLength是DLC代码（FDCAN_DLC_BYTES_n = n<<16），不是字节数 */
+		/* 本HAL的DataLength约定（已核对源码 stm32h7xx_hal_fdcan.c:3074）：
+		 * TX/RX均为"DLC代码"原值——代码0~8=0~8字节，9~15=12/16/20/24/32/48/64字节
+		 * （注意FDCAN_DLC_BYTES_12=0x09，不是12！之前的 n<<16 映射是错的，
+		 *  曾导致8字节反馈帧被算成len=0、dm_fb永远全零） */
 		uint32_t dlc = pRxHeader.DataLength;
-		if      (dlc <= FDCAN_DLC_BYTES_8)  len = (uint8_t)(dlc >> 16);
-		else if (dlc <= FDCAN_DLC_BYTES_12) len = 12;
-		else if (dlc <= FDCAN_DLC_BYTES_16) len = 16;
-		else if (dlc <= FDCAN_DLC_BYTES_20) len = 20;
-		else if (dlc <= FDCAN_DLC_BYTES_24) len = 24;
-		else if (dlc <= FDCAN_DLC_BYTES_32) len = 32;
-		else if (dlc <= FDCAN_DLC_BYTES_48) len = 48;
-		else                                len = 64;
+		if      (dlc <= 8U)  len = (uint8_t)dlc;
+		else if (dlc == 9U)  len = 12;
+		else if (dlc == 10U) len = 16;
+		else if (dlc == 11U) len = 20;
+		else if (dlc == 12U) len = 24;
+		else if (dlc == 13U) len = 32;
+		else if (dlc == 14U) len = 48;
+		else                 len = 64;
 
 		return len;//接收数据
 	}
@@ -142,6 +143,7 @@ volatile uint8_t can_tx_quiet = 0;        /* =1时fdcanx_send_data不打印TX日志(快
 volatile uint32_t dm_rx_count = 0;        /* 收到的总帧数（含任意ID，检测"有反应"用） */
 volatile uint8_t dm_fb[8] = {0};          /* 最近一帧反馈报文原文 */
 volatile uint8_t dm_fb_new = 0;           /* =1表示有未处理的反馈帧 */
+volatile uint32_t dm_fb_count = 0;        /* ID=0x10帧计数 */
 
 /* 电机应答统一解码：读参数应答(帧ID=Master ID 0x10, D2==0x33)解出数值，
  * 其余帧打印原始内容。三个CAN口的回调都走这里，电机接哪路都能看到。 */
@@ -177,6 +179,7 @@ static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, u
 	}
 	else if (id == 0x10)
 	{
+		dm_fb_count++;                            /* 统计ID=0x10帧频率 */
 		/* MIT模式反馈帧：D0=ERR<<4|ID，D1~D5=位置/速度/扭矩定点数，
 		 * D6=T_MOS、D7=T_Rotor。存起来给主循环解码打印 */
 		for (uint8_t i = 0; i < 8 && i < len; i++)
