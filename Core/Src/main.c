@@ -150,7 +150,7 @@ int main(void)
 	 * 按达妙说明书：kp=0、kd!=0、给定v_des可实现匀速转动。 */
 	uint8_t mit0[8];
 	int pi = f2u(0.0f, -PMAX_F, PMAX_F, 16);   /* 位置给定：0 */
-	int vi = f2u(1.0f, -VMAX_F, VMAX_F, 12);   /* 速度给定：1.0 rad/s */
+	int vi = f2u(5.0f, -VMAX_F, VMAX_F, 12);   /* 速度给定：1.0 rad/s */
 	int kpi = f2u(0.0f, 0.0f, 100.0f, 12);    /* kp=0：速度控制 */
 	int kdi = f2u(0.5f, 0.0f, 20.0f, 12);     /* kd=0.5：保持非0 */
 	int ti = f2u(0.0f, -TMAX_F, TMAX_F, 12);   /* t_ff=0：零力矩前馈 */
@@ -185,10 +185,13 @@ int main(void)
 		log_print("[SCAN] 0x00~0x7F 全无0x33应答（电机不在线 or MasterID≠0x10 or 读参数走不通）\r\n");
 
 	/* 上电顺序：先失能(停掉一切残余动作) -> 再使能 */
-	uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
-	fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
-	log_print("[SAFE] 已发失能帧，清除残余动作\r\n");
-	HAL_Delay(200);
+	//uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+	//fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
+	//log_print("[SAFE] 已发失能帧，清除残余动作\r\n");
+	//HAL_Delay(200);
+
+
+
 	uint8_t en[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
 	fdcanx_send_data(&hfdcan1, MOTOR_ID, en, 8);
 	log_print("[EN] 电机ID=0x%03X 已使能，进入零扭矩保持（绿灯应常亮，轴可用手转动）\r\n",
