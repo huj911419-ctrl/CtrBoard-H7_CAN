@@ -27,6 +27,7 @@
 #include "bsp_fdcan.h"//
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -72,6 +73,27 @@ static int f2u(float x, float lo, float hi, int bits)
 static float u2f(uint32_t x, float lo, float hi, int bits)
 {
 	return (float)x * (hi - lo) / (float)((1 << bits) - 1) + lo;
+}
+
+/* 通过 CAN 写参数寄存器：0x7FF + CANID + 0x55 + RID + 32位数据（低字节在前） */
+static void dm_write_u32_param(uint32_t value, uint8_t rid)
+{
+	uint8_t wr[8] = {0};
+	wr[0] = (uint8_t)(MOTOR_ID & 0xFF);
+	wr[1] = (uint8_t)((MOTOR_ID >> 8) & 0xFF);
+	wr[2] = 0x55;
+	wr[3] = rid;
+	wr[4] = (uint8_t)(value & 0xFF);
+	wr[5] = (uint8_t)((value >> 8) & 0xFF);
+	wr[6] = (uint8_t)((value >> 16) & 0xFF);
+	wr[7] = (uint8_t)((value >> 24) & 0xFF);
+	fdcanx_send_data(&hfdcan1, 0x7FF, wr, 8);
+}
+
+/* CTRL_MODE寄存器(0x0A)：1=MIT，2=位置速度，3=速度，4=力位混控 */
+static void dm_set_mode(uint32_t mode)
+{
+	dm_write_u32_param(mode, 0x0A);
 }
 /* USER CODE END 0 */
 
@@ -148,19 +170,9 @@ int main(void)
    * 触发电机每帧回反馈 → 解码出位置/速度/扭矩/双温度打印。 */
 	/* MIT速度控制帧：p=0，v=1.0rad/s，kp=0，kd=0.5，t_ff=0
 	 * 按达妙说明书：kp=0、kd!=0、给定v_des可实现匀速转动。 */
-	uint8_t mit0[8];
-	int pi = f2u(0.0f, -PMAX_F, PMAX_F, 16);   /* 位置给定：0 */
-	int vi = f2u(5.0f, -VMAX_F, VMAX_F, 12);   /* 速度给定：1.0 rad/s */
-	int kpi = f2u(0.0f, 0.0f, 100.0f, 12);    /* kp=0：速度控制 */
-	int kdi = f2u(0.5f, 0.0f, 20.0f, 12);     /* kd=0.5：保持非0 */
-	int ti = f2u(0.0f, -TMAX_F, TMAX_F, 12);   /* t_ff=0：零力矩前馈 */
-	mit0[0] = pi >> 8;  mit0[1] = pi & 0xFF;
-	mit0[2] = vi >> 4;
-	mit0[3] = (vi & 0xF) << 4 | (kpi >> 8); /* kp高4位 */
-	mit0[4] = kpi & 0xFF;                   /* kp低8位 */
-	mit0[5] = kdi >> 4;                     /* kd[11:4] */
-	mit0[6] = (uint8_t)((kdi & 0xF) << 4 | (ti >> 8)); /* kd[3:0], t_ff[11:8] */
-	mit0[7] = (uint8_t)(ti & 0xFF);         /* t_ff[7:0] */
+	uint8_t speed_cmd[4];
+	float speed_target = 1.0f;   /* 目标速度 rad/s，先用低速测试 */
+	memcpy(speed_cmd, &speed_target, sizeof(speed_cmd));
 	/* ===== 重新扫描电机真实 CAN ID（0x00~0x7F）=====
 	 * 格式/供电/物理层均已确认正确，唯一能解释"读参数无应答+使能无效+反馈全0"
 	 * 的就是 CAN ID 不匹配。逐个候选ID发读参数帧读VBus(0x3C)，能收到0x33应答者
@@ -184,18 +196,19 @@ int main(void)
 	else
 		log_print("[SCAN] 0x00~0x7F 全无0x33应答（电机不在线 or MasterID≠0x10 or 读参数走不通）\r\n");
 
-	/* 上电顺序：先失能(停掉一切残余动作) -> 再使能 */
-	//uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
-	//fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
-	//log_print("[SAFE] 已发失能帧，清除残余动作\r\n");
-	//HAL_Delay(200);
+	/* 上电顺序：先失能 -> 写CTRL_MODE=3（速度模式） -> 再使能 */
+	uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+	fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
+	HAL_Delay(100);
 
-
+	/* 0x0A = CTRL_MODE，写入3表示速度模式。该操作立即生效，但不保存到Flash。 */
+	dm_set_mode(3);
+	log_print("[MODE] CTRL_MODE=3，已切换到速度模式\r\n");
+	HAL_Delay(100);
 
 	uint8_t en[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
 	fdcanx_send_data(&hfdcan1, MOTOR_ID, en, 8);
-	log_print("[EN] 电机ID=0x%03X 已使能，进入零扭矩保持（绿灯应常亮，轴可用手转动）\r\n",
-	          MOTOR_ID);
+	log_print("[EN] 电机ID=0x%03X 已使能，目标速度=%.2f rad/s\r\n", MOTOR_ID, speed_target);
 
 	/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
 	 * 手册读参数帧只有4字节(D0=CANID_L,D1=CANID_H,D2=0x33,D3=RID)，发8字节DLC不匹配电机不响应 */
@@ -210,8 +223,8 @@ int main(void)
 
 	while (1)
 	{
-		/* 100Hz零扭矩命令：维持使能状态 + 触发反馈帧 */
-		fdcanx_send_data(&hfdcan1, MOTOR_ID, mit0, 8);
+		/* 100Hz速度模式命令：ID=0x200+MOTOR_ID，4字节float，小端 */
+		fdcanx_send_data(&hfdcan1, (uint16_t)(0x200 + MOTOR_ID), speed_cmd, 4);
 
 		/* 每秒打印帧计数：看ID=0x10帧是"每MIT帧都回(~100/s)"还是"只来一次" */
 		static uint32_t last_cnt = 0, prev_rx = 0, prev_fb = 0;
