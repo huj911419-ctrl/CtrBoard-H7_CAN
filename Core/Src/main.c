@@ -39,7 +39,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* Learning switch: keep DBUS reception/logging active, but disconnect it from
+ * both motors. Set to 1 later when remote motor control is needed again. */
+#define REMOTE_MOTOR_CONTROL_ENABLE  0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -203,7 +205,8 @@ int main(void)
 
 	if (found_id != 0xFFFF)
 	{
-		/* 上电顺序：先失能 -> 写CTRL_MODE=3（速度模式） -> 再使能 */
+		/* 上电顺序：先失能 -> 写CTRL_MODE=3（速度模式）。
+		 * 是否再使能由 REMOTE_MOTOR_CONTROL_ENABLE 决定。 */
 		uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
 		fdcanx_send_data(&hfdcan1, dm_motor_id, dis, 8);
 		HAL_Delay(100);
@@ -213,8 +216,12 @@ int main(void)
 		log_print("[MODE] Requested CTRL_MODE=3 (speed).\r\n");
 		HAL_Delay(100);
 
+#if REMOTE_MOTOR_CONTROL_ENABLE
 		log_print("[EN] Waiting for DBUS S1=%u before enabling ESC_ID=0x%03X.\r\n",
 		          (unsigned)DBUS_ARM_S1_VALUE, dm_motor_id);
+#else
+		log_print("[EN] Remote motor control disabled; DM remains disabled.\r\n");
+#endif
 
 		/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
 		 * 手册读参数帧只有4字节(D0=CANID_L,D1=CANID_H,D2=0x33,D3=RID)，发8字节DLC不匹配电机不响应 */
@@ -234,13 +241,20 @@ int main(void)
 
 	} /* DM startup only when CAN1 scan succeeded. */
 
-	log_print("[DJI|CAN2] ID config=%u (0=auto), DBUS-gated target=%ldrpm, current limit=%d.\r\n",
+	log_print("[DJI|CAN2] ID config=%u (0=auto), default target=%ldrpm, current limit=%d.\r\n",
 	          (unsigned)DJI_MOTOR_ID, (long)DJI_DEFAULT_OUTPUT_RPM, DJI_CURRENT_LIMIT);
+#if REMOTE_MOTOR_CONTROL_ENABLE
+	log_print("[RC] Motor control ENABLED: S1 arms DM, S2 gates C620.\r\n");
+#else
+	log_print("[RC] Motor control DISABLED: DBUS receive/log only; motors stay safe.\r\n");
+#endif
 	log_print("[DJI|CAN2] Listen 1s for C620 ID; CAN3 reserved.\r\n");
 	can_tx_quiet = 1; /* periodic control must not print a UART line per frame */
 	uint32_t last_dm_command = HAL_GetTick();
 	uint32_t last_dji_log = HAL_GetTick();
+#if REMOTE_MOTOR_CONTROL_ENABLE
 	uint8_t dm_enabled = 0U;
+#endif
 	while (1)
 	{
 		uint32_t now = HAL_GetTick();
@@ -249,13 +263,11 @@ int main(void)
 		uint8_t rc_online = dbus_is_online(now);
 		uint8_t rc_armed = rc_online && dbus_is_armed(&rc);
 		uint8_t friction_on = rc_armed && dbus_friction_enabled(&rc);
-		/* The C620 loop remains closed on CAN2, but cannot arm without DBUS. */
+#if REMOTE_MOTOR_CONTROL_ENABLE
+		/* Remote control path: S2 gates C620, CH0 commands DM speed. */
 		dji_run_enable = friction_on;
 		dji_target_output_rpm = friction_on ? DJI_DEFAULT_OUTPUT_RPM : 0.0f;
-		/* One DM motor is currently installed on CAN1. Stick CH1 commands speed;
-		 * center stops it. This is a speed-mode gimbal command, not position mode. */
 		speed_target = rc_armed ? dbus_channel_normalized(&rc, 0U) * 2.0f : 0.0f;
-		memcpy(speed_cmd, &speed_target, sizeof(speed_cmd));
 
 		if (found_id != 0xFFFF && dm_enabled != rc_armed)
 		{
@@ -264,6 +276,14 @@ int main(void)
 			                     rc_armed ? 0xFC : 0xFD};
 			fdcanx_send_data(&hfdcan1, dm_motor_id, command, 8);
 		}
+#else
+		/* Learning mode: keep DBUS alive for observation, but do not let it
+		 * enable either motor or generate a non-zero motor target. */
+		dji_run_enable = 0U;
+		dji_target_output_rpm = 0.0f;
+		speed_target = 0.0f;
+#endif
+		memcpy(speed_cmd, &speed_target, sizeof(speed_cmd));
 		dji_motor_task(now);
 		/* 100Hz速度模式命令：ID=0x200+ESC_ID，4字节float，小端 */
 		if (found_id != 0xFFFF && now - last_dm_command >= 10U)
