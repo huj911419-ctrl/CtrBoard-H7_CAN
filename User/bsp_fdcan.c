@@ -1,95 +1,111 @@
 #include "bsp_fdcan.h"
+#include "dji_motor.h"
 #include <string.h>
+
+/* åªåœ¨ç¡®å®å‘å‡º0x33è¯»å‚æ•°è¯·æ±‚æ—¶ï¼Œæ‰æŠŠåŒ¹é…çš„8å­—èŠ‚å¸§å½“æˆå‚æ•°åº”ç­”ã€‚
+ * é¿å…æ™®é€šçŠ¶æ€åé¦ˆçš„D2å¶ç„¶ç­‰äº0x33æ—¶è¢«è¯¯åˆ¤ã€‚ */
+static volatile uint8_t dm_param_waiting = 0;
+static volatile uint16_t dm_expected_canid = 0xFFFF;
+static volatile uint8_t dm_expected_opcode = 0;
+static volatile uint8_t dm_expected_rid = 0;
+
 /**
 ************************************************************************
 * @brief:      	bsp_can_init(void)
 * @param:       void
 * @retval:     	void
-* @details:    	CAN Ê¹ÄÜ
+* @details:    	CAN Ê¹ï¿½ï¿½
 ************************************************************************
 **/
 void bsp_can_init(void)
 {
-	can_filter_init();
-	HAL_FDCAN_Start(&hfdcan1);                               //¿ªÆôFDCAN
-	HAL_FDCAN_Start(&hfdcan2);
-	HAL_FDCAN_Start(&hfdcan3);
-	HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-	HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-	HAL_FDCAN_ActivateNotification(&hfdcan3, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+    can_filter_init();
+    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK ||
+        HAL_FDCAN_Start(&hfdcan2) != HAL_OK ||
+        HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK ||
+        HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
+        Error_Handler();
+    /* CAN3 is reserved: no start, notifications or motor protocol. */
 }
 /**
 ************************************************************************
 * @brief:      	can_filter_init(void)
 * @param:       void
 * @retval:     	void
-* @details:    	CANÂË²¨Æ÷³õÊ¼»¯
+* @details:    	CANï¿½Ë²ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼ï¿½ï¿½
 ************************************************************************
 **/
 void can_filter_init(void)
 {
-	FDCAN_FilterTypeDef fdcan_filter;
-	
-	fdcan_filter.IdType = FDCAN_STANDARD_ID;                       //±ê×¼ID
-	fdcan_filter.FilterIndex = 0;                                  //ÂË²¨Æ÷Ë÷Òı                   
-	fdcan_filter.FilterType = FDCAN_FILTER_MASK;                   
-	fdcan_filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;           //¹ıÂËÆ÷0¹ØÁªµ½FIFO0  
-	fdcan_filter.FilterID1 = 0x00;                               
-	fdcan_filter.FilterID2 = 0x00;
+    FDCAN_FilterTypeDef filter = {0};
+    filter.IdType = FDCAN_STANDARD_ID;
+    filter.FilterIndex = 0;
+    filter.FilterType = FDCAN_FILTER_MASK;
+    filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    filter.FilterID1 = 0;
+    filter.FilterID2 = 0;
+    /* CAN1 keeps accepting every standard ID for the existing DM ID scan. */
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &filter) != HAL_OK ||
+        HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                                    FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK)
+        Error_Handler();
 
-	HAL_FDCAN_ConfigFilter(&hfdcan1,&fdcan_filter); 		 				  //½ÓÊÕID2
-	//¾Ü¾ø½ÓÊÕÆ¥Åä²»³É¹¦µÄ±ê×¼IDºÍÀ©Õ¹ID,²»½ÓÊÜÔ¶³ÌÖ¡
-	HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,FDCAN_REJECT,FDCAN_REJECT,FDCAN_REJECT_REMOTE,FDCAN_REJECT_REMOTE);
-	HAL_FDCAN_ConfigFifoWatermark(&hfdcan1, FDCAN_CFG_RX_FIFO0, 1);
-//	HAL_FDCAN_ConfigFifoWatermark(&hfdcan1, FDCAN_CFG_RX_FIFO1, 1);
-//	HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_TX_COMPLETE, FDCAN_TX_BUFFER0);
+    /* CAN2 only accepts C620 feedback IDs (motors 1..8). */
+    filter.FilterType = FDCAN_FILTER_RANGE;
+    filter.FilterID1 = 0x201U;
+    filter.FilterID2 = 0x208U;
+    if (HAL_FDCAN_ConfigFilter(&hfdcan2, &filter) != HAL_OK ||
+        HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_REJECT, FDCAN_REJECT,
+                                    FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK)
+        Error_Handler();
 }
 /**
 ************************************************************************
 * @brief:      	fdcanx_send_data(FDCAN_HandleTypeDef *hfdcan, uint16_t id, uint8_t *data, uint32_t len)
-* @param:       hfdcan£ºFDCAN¾ä±ú
-* @param:       id£ºCANÉè±¸ID
-* @param:       data£º·¢ËÍµÄÊı¾İ
-* @param:       len£º·¢ËÍµÄÊı¾İ³¤¶È
+* @param:       hfdcanï¿½ï¿½FDCANï¿½ï¿½ï¿½
+* @param:       idï¿½ï¿½CANï¿½è±¸ID
+* @param:       dataï¿½ï¿½ï¿½ï¿½ï¿½Íµï¿½ï¿½ï¿½ï¿½ï¿½
+* @param:       lenï¿½ï¿½ï¿½ï¿½ï¿½Íµï¿½ï¿½ï¿½ï¿½İ³ï¿½ï¿½ï¿½
 * @retval:     	void
-* @details:    	·¢ËÍÊı¾İ
+* @details:    	ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 ************************************************************************
 **/
 uint8_t fdcanx_send_data(hcan_t *hfdcan, uint16_t id, uint8_t *data, uint32_t len)
 {	
-    FDCAN_TxHeaderTypeDef pTxHeader;
-    pTxHeader.Identifier=id;
-    pTxHeader.IdType=FDCAN_STANDARD_ID;
-    pTxHeader.TxFrameType=FDCAN_DATA_FRAME;
-	
-	if(len<=8)
-		pTxHeader.DataLength = len;
-	if(len==12)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_12;
-	if(len==16)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_16;
-	if(len==20)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_20;
-	if(len==24)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_24;
-	if(len==32)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_32;
-	if(len==48)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_48;
-	if(len==64)
-		pTxHeader.DataLength = FDCAN_DLC_BYTES_64;
-	
+    /* This BSP is classic CAN only, with 8-byte message RAM elements. */
+    if (data == NULL || len > 8U || id > 0x7FFU || hfdcan == &hfdcan3)
+        return 1;
+    FDCAN_TxHeaderTypeDef pTxHeader = {0};
+    pTxHeader.Identifier = id;
+    pTxHeader.IdType = FDCAN_STANDARD_ID;
+    pTxHeader.TxFrameType = FDCAN_DATA_FRAME;
+    pTxHeader.DataLength = len; /* bundled HAL uses unshifted DLC values */
     pTxHeader.ErrorStateIndicator=FDCAN_ESI_ACTIVE;
-    pTxHeader.BitRateSwitch=FDCAN_BRS_OFF;   /* ¾­µäCAN£º¹Ø±Õ±äËÙ£¨BRS£© */
-    pTxHeader.FDFormat=FDCAN_CLASSIC_CAN;    /* ¾­µäCANÖ¡¡ª¡ªµç»úÖ»ÈÏ¾­µäÖ¡£¬Ô­Àı³ÌµÄFDÖ¡»á±»µç»úÎŞÊÓ */
+    pTxHeader.BitRateSwitch=FDCAN_BRS_OFF;   /* ï¿½ï¿½ï¿½ï¿½CANï¿½ï¿½ï¿½Ø±Õ±ï¿½ï¿½Ù£ï¿½BRSï¿½ï¿½ */
+    pTxHeader.FDFormat=FDCAN_CLASSIC_CAN;    /* ï¿½ï¿½ï¿½ï¿½CANÖ¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö»ï¿½Ï¾ï¿½ï¿½ï¿½Ö¡ï¿½ï¿½Ô­ï¿½ï¿½ï¿½Ìµï¿½FDÖ¡ï¿½á±»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
     pTxHeader.TxEventFifoControl=FDCAN_NO_TX_EVENTS;
     pTxHeader.MessageMarker=0;
  
-	/* ÎŞÂÛ³É°Ü¶¼´òÓ¡£º´®¿ÚËù¼û = CAN1 Ëù·¢¡£
-	 * ×¢ÒâÕâĞĞ´òÓ¡·¢ÉúÔÚÖ¡"Èë¶Ó"Ê±¡ª¡ªÕæÕıµÄ·¢ËÍÓÉÓ²¼şÒì²½Íê³É£¬
-	 * Èô×ÜÏßÉÏÃ»ÓĞ½ÚµãÓ¦´ğ(ACK)£¬Ö¡»á±»Ó²¼ş·´¸´ÖØ·¢£¨Ñ§Ï°Òªµã£© */
+	/* ï¿½ï¿½ï¿½Û³É°Ü¶ï¿½ï¿½ï¿½Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ = CAN1 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+	 * ×¢ï¿½ï¿½ï¿½ï¿½ï¿½Ğ´ï¿½Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¡"ï¿½ï¿½ï¿½"Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä·ï¿½ï¿½ï¿½ï¿½ï¿½Ó²ï¿½ï¿½ï¿½ì²½ï¿½ï¿½É£ï¿½
+	 * ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã»ï¿½Ğ½Úµï¿½Ó¦ï¿½ï¿½(ACK)ï¿½ï¿½Ö¡ï¿½á±»Ó²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø·ï¿½ï¿½ï¿½Ñ§Ï°Òªï¿½ã£© */
+	uint8_t is_param_request =
+		(hfdcan == &hfdcan1) && (id == 0x7FFU) &&
+		((len == 4U && data[2] == 0x33U) ||
+		 (len == 8U && data[2] == 0x55U));
+	if (is_param_request)
+	{
+		dm_expected_canid = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+		dm_expected_opcode = data[2];
+		dm_expected_rid = data[3];
+		dm_param_waiting = 1;
+	}
+
 	uint8_t ok = (HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &pTxHeader, data) == HAL_OK);
-	if (!can_tx_quiet)
+	if (!ok && is_param_request)
+		dm_param_waiting = 0;
+
+	if (!can_tx_quiet && hfdcan == &hfdcan1)
 	{
 		const char *port = (hfdcan->Instance == FDCAN1) ? "CAN1" :
 		                   (hfdcan->Instance == FDCAN2) ? "CAN2" : "CAN3";
@@ -100,88 +116,95 @@ uint8_t fdcanx_send_data(hcan_t *hfdcan, uint16_t id, uint8_t *data, uint32_t le
 /**
 ************************************************************************
 * @brief:      	fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint8_t *buf)
-* @param:       hfdcan£ºFDCAN¾ä±ú
-* @param:       buf£º½ÓÊÕÊı¾İ»º´æ
-* @retval:     	½ÓÊÕµÄÊı¾İ³¤¶È
-* @details:    	½ÓÊÕÊı¾İ
+* @param:       hfdcanï¿½ï¿½FDCANï¿½ï¿½ï¿½
+* @param:       bufï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½İ»ï¿½ï¿½ï¿½
+* @retval:     	ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½ï¿½İ³ï¿½ï¿½ï¿½
+* @details:    	ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 ************************************************************************
 **/
 uint8_t fdcanx_receive(hcan_t *hfdcan, uint16_t *rec_id, uint8_t *buf)
 {
-	FDCAN_RxHeaderTypeDef pRxHeader;
-	uint8_t len;
-
-	if(HAL_FDCAN_GetRxMessage(hfdcan,FDCAN_RX_FIFO0, &pRxHeader, buf)==HAL_OK)
-	{
-		*rec_id = pRxHeader.Identifier;
-		/* ±¾HALµÄDataLengthÔ¼¶¨£¨ÒÑºË¶ÔÔ´Âë stm32h7xx_hal_fdcan.c:3074£©£º
-		 * TX/RX¾ùÎª"DLC´úÂë"Ô­Öµ¡ª¡ª´úÂë0~8=0~8×Ö½Ú£¬9~15=12/16/20/24/32/48/64×Ö½Ú
-		 * £¨×¢ÒâFDCAN_DLC_BYTES_12=0x09£¬²»ÊÇ12£¡Ö®Ç°µÄ n<<16 Ó³ÉäÊÇ´íµÄ£¬
-		 *  Ôøµ¼ÖÂ8×Ö½Ú·´À¡Ö¡±»Ëã³Élen=0¡¢dm_fbÓÀÔ¶È«Áã£© */
-		uint32_t dlc = pRxHeader.DataLength;
-		if      (dlc <= 8U)  len = (uint8_t)dlc;
-		else if (dlc == 9U)  len = 12;
-		else if (dlc == 10U) len = 16;
-		else if (dlc == 11U) len = 20;
-		else if (dlc == 12U) len = 24;
-		else if (dlc == 13U) len = 32;
-		else if (dlc == 14U) len = 48;
-		else                 len = 64;
-
-		return len;//½ÓÊÕÊı¾İ
-	}
-	return 0;
+    FDCAN_RxHeaderTypeDef header;
+    uint8_t data[64];
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &header, data) != HAL_OK)
+        return 0;
+    if (header.IdType != FDCAN_STANDARD_ID || header.RxFrameType != FDCAN_DATA_FRAME ||
+        header.FDFormat != FDCAN_CLASSIC_CAN || header.DataLength > 8U)
+        return 0;
+    *rec_id = (uint16_t)header.Identifier;
+    memcpy(buf, data, header.DataLength);
+    return (uint8_t)header.DataLength;
 }
 
-
-
-/* µç»ú0x33Ó¦´ğµÄ"²¶»ñĞÅºÅ"£ºÖ÷Ñ­»·É¨ÃèIDÊ±¿¿ËüÅĞ¶ÏÊÔÌ½ÊÇ·ñÃüÖĞ */
+/* ï¿½ï¿½ï¿½0x33Ó¦ï¿½ï¿½ï¿½"ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½"ï¿½ï¿½ï¿½ï¿½Ñ­ï¿½ï¿½É¨ï¿½ï¿½IDÊ±ï¿½ï¿½ï¿½ï¿½ï¿½Ğ¶ï¿½ï¿½ï¿½Ì½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ */
 volatile uint8_t dm_rx33_flag = 0;
 volatile uint16_t dm_reply_canid = 0xFFFF;
 volatile uint8_t dm_reply_rid = 0;
-volatile uint8_t can_tx_quiet = 0;        /* =1Ê±fdcanx_send_data²»´òÓ¡TXÈÕÖ¾(¿ìÉ¨ÓÃ) */
-volatile uint32_t dm_rx_count = 0;        /* ÊÕµ½µÄ×ÜÖ¡Êı£¨º¬ÈÎÒâID£¬¼ì²â"ÓĞ·´Ó¦"ÓÃ£© */
-volatile uint8_t dm_fb[8] = {0};          /* ×î½üÒ»Ö¡·´À¡±¨ÎÄÔ­ÎÄ */
-volatile uint8_t dm_fb_new = 0;           /* =1±íÊ¾ÓĞÎ´´¦ÀíµÄ·´À¡Ö¡ */
-volatile uint32_t dm_fb_count = 0;        /* ID=0x10Ö¡¼ÆÊı */
+volatile uint16_t dm_master_id = 0xFFFF;  /* å‚æ•°åº”ç­”/çŠ¶æ€åé¦ˆä½¿ç”¨çš„MST_ID */
+volatile uint8_t can_tx_quiet = 0;        /* =1Ê±fdcanx_send_dataï¿½ï¿½ï¿½ï¿½Ó¡TXï¿½ï¿½Ö¾(ï¿½ï¿½É¨ï¿½ï¿½) */
+volatile uint32_t dm_rx_count = 0;        /* ï¿½Õµï¿½ï¿½ï¿½ï¿½ï¿½Ö¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½IDï¿½ï¿½ï¿½ï¿½ï¿½"ï¿½Ğ·ï¿½Ó¦"ï¿½Ã£ï¿½ */
+volatile uint8_t dm_fb[8] = {0};          /* ï¿½ï¿½ï¿½Ò»Ö¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô­ï¿½ï¿½ */
+volatile uint8_t dm_fb_new = 0;           /* =1ï¿½ï¿½Ê¾ï¿½ï¿½Î´ï¿½ï¿½ï¿½ï¿½ï¿½Ä·ï¿½ï¿½ï¿½Ö¡ */
+volatile uint32_t dm_fb_count = 0;        /* MST_IDåé¦ˆå¸§è®¡æ•° */
 
-/* µç»úÓ¦´ğÍ³Ò»½âÂë£º¶Á²ÎÊıÓ¦´ğ(Ö¡ID=Master ID 0x10, D2==0x33)½â³öÊıÖµ£¬
- * ÆäÓàÖ¡´òÓ¡Ô­Ê¼ÄÚÈİ¡£Èı¸öCAN¿ÚµÄ»Øµ÷¶¼×ßÕâÀï£¬µç»ú½ÓÄÄÂ·¶¼ÄÜ¿´µ½¡£ */
+/* è¾¾å¦™å‚æ•°åº”ç­”ä¸çŠ¶æ€åé¦ˆå…±ç”¨MST_IDã€‚
+ * å‚æ•°åº”ç­”å¿…é¡»ç»“åˆå½“å‰è¯·æ±‚çš„ESC_ID/opcode/RIDåŒ¹é…ï¼Œå‰©ä½™MST_IDå¸§æ‰æŒ‰çŠ¶æ€åé¦ˆå¤„ç†ã€‚ */
 static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, uint8_t len)
 {
-	if (id == 0x10 && len >= 8 && d[2] == 0x33)
+	/* å‚æ•°åº”ç­”çš„CANå¸§IDæ˜¯MST_IDï¼Œä¸åº”å†™æ­»æˆ0x10ã€‚
+	 * D0/D1å›æ˜¾è¢«è®¿é—®çš„ESC_IDï¼ŒåŒæ—¶åŒ¹é…å½“å‰è¯·æ±‚çš„opcodeä¸RIDã€‚ */
+	uint16_t echoed_canid = (len >= 2) ? (uint16_t)(d[0] | ((uint16_t)d[1] << 8)) : (uint16_t)0xFFFF;
+	if (dm_param_waiting && len >= 8 &&
+	    echoed_canid == dm_expected_canid &&
+	    d[2] == dm_expected_opcode && d[3] == dm_expected_rid)
 	{
-		dm_rx33_flag = 1;                              /* Í¨ÖªÉ¨ÃèÆ÷£ºÃüÖĞÁË */
-		dm_reply_canid = d[0] | ((uint16_t)d[1] << 8); /* Ó¦´ğÀï»ØÏÔµç»ú×Ô¼ºµÄID */
+		dm_param_waiting = 0;
+		dm_reply_canid = echoed_canid;
 		dm_reply_rid = d[3];
+		dm_master_id = id;  /* å‚æ•°åº”ç­”æœ¬èº«çš„å¸§IDå°±æ˜¯MST_ID */
 
 		uint32_t u = (uint32_t)d[4] | ((uint32_t)d[5] << 8)
 		           | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
-		float f;
-		memcpy(&f, &u, 4);
 
-		if (d[3] == 0x3C)          /* VBus µçÔ´µçÑ¹ */
+		if (d[2] == 0x33U)
 		{
-			uint32_t mv = (uint32_t)(f * 100.0f + 0.5f);
-			log_print("[PARAM|%s] VBus = %lu.%02lu V\r\n", port,
-			          (unsigned long)(mv / 100), (unsigned long)(mv % 100));
+			dm_rx33_flag = 1;
+			float f;
+			memcpy(&f, &u, 4);
+
+			if (d[3] == 0x07)          /* MST_ID åé¦ˆID */
+			{
+				dm_master_id = (uint16_t)u;
+				log_print("[PARAM|%s] MST_ID = 0x%03X\r\n", port, dm_master_id);
+			}
+			else if (d[3] == 0x3C)     /* VBus ç”µæºç”µå‹ */
+			{
+				uint32_t mv = (uint32_t)(f * 100.0f + 0.5f);
+				log_print("[PARAM|%s] VBus = %lu.%02lu V\r\n", port,
+				          (unsigned long)(mv / 100), (unsigned long)(mv % 100));
+			}
+			else if (d[3] == 0x50)     /* p_m ç”µæœºå½“å‰ä½ç½®(rad) */
+			{
+				float a = (f < 0) ? -f : f;
+				uint32_t cr = (uint32_t)(a * 100.0f + 0.5f);
+				log_print("[PARAM|%s] p_m = %s%lu.%02lu rad\r\n", port, (f < 0) ? "-" : "",
+				          (unsigned long)(cr / 100), (unsigned long)(cr % 100));
+			}
+			else
+				log_print("[PARAM|%s] RID=0x%02X raw=0x%08lX\r\n",
+				          port, d[3], (unsigned long)u);
 		}
-		else if (d[3] == 0x50)     /* p_m µç»úµ±Ç°Î»ÖÃ(rad) */
+		else /* 0x55 å†™å‚æ•°åº”ç­” */
 		{
-			float a = (f < 0) ? -f : f;
-			uint32_t cr = (uint32_t)(a * 100.0f + 0.5f);
-			log_print("[PARAM|%s] p_m = %s%lu.%02lu rad\r\n", port, (f < 0) ? "-" : "",
-			          (unsigned long)(cr / 100), (unsigned long)(cr % 100));
-		}
-		else
-			log_print("[PARAM|%s] RID=0x%02X raw=0x%08lX\r\n",
+			log_print("[PARAM-WR|%s] RID=0x%02X raw=0x%08lX\r\n",
 			          port, d[3], (unsigned long)u);
+		}
 	}
-	else if (id == 0x10)
+	else if (id == dm_master_id && len >= 8)
 	{
-		dm_fb_count++;                            /* Í³¼ÆID=0x10Ö¡ÆµÂÊ */
-		/* MITÄ£Ê½·´À¡Ö¡£ºD0=ERR<<4|ID£¬D1~D5=Î»ÖÃ/ËÙ¶È/Å¤¾Ø¶¨µãÊı£¬
-		 * D6=T_MOS¡¢D7=T_Rotor¡£´æÆğÀ´¸øÖ÷Ñ­»·½âÂë´òÓ¡ */
+		dm_fb_count++;                            /* ç»Ÿè®¡MST_IDåé¦ˆå¸§é¢‘ç‡ */
+		/* MITÄ£Ê½ï¿½ï¿½ï¿½ï¿½Ö¡ï¿½ï¿½D0=ERR<<4|IDï¿½ï¿½D1~D5=Î»ï¿½ï¿½/ï¿½Ù¶ï¿½/Å¤ï¿½Ø¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+		 * D6=T_MOSï¿½ï¿½D7=T_Rotorï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñ­ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¡ */
 		for (uint8_t i = 0; i < 8 && i < len; i++)
 			dm_fb[i] = d[i];
 		dm_fb_new = 1;
@@ -192,53 +215,37 @@ static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, u
 	}
 }
 
-uint8_t rx_data1[8] = {0};
-uint16_t rec_id1;
 void fdcan1_rx_callback(void)
 {
-	uint8_t len = fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
-	motor_frame_print("CAN1", rec_id1, rx_data1, len);
-}
-uint8_t rx_data2[8] = {0};
-uint16_t rec_id2;
-void fdcan2_rx_callback(void)
-{
-	uint8_t len = fdcanx_receive(&hfdcan2, &rec_id2, rx_data2);
-	motor_frame_print("CAN2", rec_id2, rx_data2, len);
-}
-uint8_t rx_data3[8] = {0};
-uint16_t rec_id3;
-void fdcan3_rx_callback(void)
-{
-	uint8_t len = fdcanx_receive(&hfdcan3, &rec_id3, rx_data3);
-	motor_frame_print("CAN3", rec_id3, rx_data3, len);
+    uint8_t data[8];
+    uint16_t id;
+    uint8_t len = fdcanx_receive(&hfdcan1, &id, data);
+    if (len != 0U) {
+        ++dm_rx_count;
+        motor_frame_print("CAN1", id, data, len);
+    }
 }
 
+void fdcan2_rx_callback(void)
+{
+    uint8_t data[8];
+    uint16_t id;
+    uint8_t len = fdcanx_receive(&hfdcan2, &id, data);
+    if (len != 0U)
+        dji_motor_on_feedback(id, data, len, HAL_GetTick());
+}
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-	dm_rx_count++;    /* ÈÎºÎÒ»Â·ÊÕµ½ÈÎºÎÖ¡¶¼¼ÆÊı£ºµç»ú"¿ª¿ÚËµ»°"µÄĞÅºÅ */
-    if(hfdcan == &hfdcan1)
-	{
-		fdcan1_rx_callback();
-	}
-	if(hfdcan == &hfdcan2)
-	{
-		fdcan2_rx_callback();
-	}
-	if(hfdcan == &hfdcan3)
-	{
-		fdcan3_rx_callback();
-	}
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0U)
+        return;
+    if (hfdcan != &hfdcan1 && hfdcan != &hfdcan2)
+        return;
+    /* Drain FIFO: C620 sends feedback at 1 kHz by default. */
+    while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) != 0U) {
+        if (hfdcan == &hfdcan1)
+            fdcan1_rx_callback();
+        else
+            fdcan2_rx_callback();
+    }
 }
-
-
-
-
-
-
-
-
-
-
-

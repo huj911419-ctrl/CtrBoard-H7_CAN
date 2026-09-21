@@ -58,6 +58,7 @@
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 extern FDCAN_HandleTypeDef hfdcan3;
+extern UART_HandleTypeDef huart7;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -282,6 +283,11 @@ void FDCAN3_IT1_IRQHandler(void)
   /* USER CODE BEGIN FDCAN3_IT1_IRQn 1 */
 
   /* USER CODE END FDCAN3_IT1_IRQn 1 */
+}
+
+void UART7_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart7);
 }
 
 /* USER CODE BEGIN 1 */

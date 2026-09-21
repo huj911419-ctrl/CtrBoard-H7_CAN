@@ -25,6 +25,7 @@
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart10;
+UART_HandleTypeDef huart7;
 
 /* USART10 init function */
 
@@ -69,6 +70,35 @@ void MX_USART10_UART_Init(void)
 
   /* USER CODE END USART10_Init 2 */
 
+}
+
+/* DT7/DR16 DBUS input on Board02 expansion UART7 RX (PE7). */
+void MX_UART7_Init(void)
+{
+  huart7.Instance = UART7;
+  huart7.Init.BaudRate = 100000;
+  huart7.Init.WordLength = UART_WORDLENGTH_9B;
+  huart7.Init.StopBits = UART_STOPBITS_1;
+  huart7.Init.Parity = UART_PARITY_EVEN;
+  huart7.Init.Mode = UART_MODE_RX;
+  huart7.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart7.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart7.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart7.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart7.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_RXINVERT_INIT;
+  huart7.AdvancedInit.RxPinLevelInvert = UART_ADVFEATURE_RXINV_ENABLE;
+  if (HAL_UART_Init(&huart7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart7, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart7) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
@@ -117,6 +147,28 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   /* USER CODE END USART10_MspInit 1 */
   }
+  else if(uartHandle->Instance==UART7)
+  {
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_UART7;
+    PeriphClkInitStruct.Usart234578ClockSelection = RCC_UART7CLKSOURCE_D2PCLK1;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_RCC_UART7_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    /* PE7 -> UART7_RX, AF7. PE8 is left unused. */
+    GPIO_InitStruct.Pin = GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_UART7;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(UART7_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(UART7_IRQn);
+  }
 }
 
 void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
@@ -139,6 +191,12 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
   /* USER CODE BEGIN USART10_MspDeInit 1 */
 
   /* USER CODE END USART10_MspDeInit 1 */
+  }
+  else if(uartHandle->Instance==UART7)
+  {
+    __HAL_RCC_UART7_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7);
+    HAL_NVIC_DisableIRQ(UART7_IRQn);
   }
 }
 

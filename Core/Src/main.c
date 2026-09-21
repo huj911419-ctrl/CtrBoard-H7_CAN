@@ -24,7 +24,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "bsp_fdcan.h"//
+#include "bsp_fdcan.h"
+#include "dji_motor.h"
+#include "dbus.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -62,14 +64,10 @@ void SystemClock_Config(void);
 uint8_t tx_data[8] = {0,1,2,3,4,5,6,7};
 
 /* MIT协议定点映射（PMAX/VMAX/TMAX=12.5/30/10，与上位机读到的保持一致） */
-#define MOTOR_ID   0x000
+static uint16_t dm_motor_id = 0x000U;  /* 运行时使用扫描到的ESC_ID */
 #define PMAX_F     12.5f
 #define VMAX_F     30.0f
 #define TMAX_F     10.0f
-static int f2u(float x, float lo, float hi, int bits)
-{
-	return (int)((x - lo) * (float)((1 << bits) - 1) / (hi - lo));
-}
 static float u2f(uint32_t x, float lo, float hi, int bits)
 {
 	return (float)x * (hi - lo) / (float)((1 << bits) - 1) + lo;
@@ -79,8 +77,8 @@ static float u2f(uint32_t x, float lo, float hi, int bits)
 static void dm_write_u32_param(uint32_t value, uint8_t rid)
 {
 	uint8_t wr[8] = {0};
-	wr[0] = (uint8_t)(MOTOR_ID & 0xFF);
-	wr[1] = (uint8_t)((MOTOR_ID >> 8) & 0xFF);
+	wr[0] = (uint8_t)(dm_motor_id & 0xFF);
+	wr[1] = (uint8_t)((dm_motor_id >> 8) & 0xFF);
 	wr[2] = 0x55;
 	wr[3] = rid;
 	wr[4] = (uint8_t)(value & 0xFF);
@@ -136,13 +134,12 @@ int main(void)
   MX_GPIO_Init();
   MX_FDCAN1_Init();
   MX_FDCAN2_Init();
-  MX_FDCAN3_Init();
+  /* CAN3 reserved: leave the peripheral and its pins uninitialized. */
   MX_USART10_UART_Init();
+  MX_UART7_Init();       /* DT7/DR16 DBUS input: PE7, 100 kbaud, inverted */
   /* USER CODE BEGIN 2 */
-	/* ===== 普通模式：给电机口上电并发使能帧 =====
-	 * 电机口电源由PMOS控制：上口OUT1(FDCAN1)=PC14，下口OUT2(FDCAN2)=PC13，
-	 * 对外5V=PC15。V1.0原理图与V1.1管脚标注图对PC13/PC15标注有修订，
-	 * 三个都拉高最稳妥：电机口必然有电，5V轨开启也无副作用。 */
+	/* Board02 V1.1: PC14=CAN1 power, PC13=CAN2 power, PC15=external 5V.
+	 * Keep the working DM power setup. C620 uses a separate 24V power branch. */
 	__HAL_RCC_GPIOC_CLK_ENABLE();
 	GPIO_InitTypeDef pwr_gpio = {0};
 	pwr_gpio.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
@@ -153,30 +150,27 @@ int main(void)
 	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET);
 
 	HAL_Delay(2000);            /* 等电机上电自检完成（红灯常亮=失能，正常） */
-	bsp_can_init();             /* 三路FDCAN启动，1Mbps经典CAN */
+	dji_motor_init(HAL_GetTick());
+	dbus_init();
+	bsp_can_init();             /* CAN1=DM, CAN2=C620, CAN3 reserved */
 	HAL_Delay(100);
 
 	log_print("\r\n=== DM-J4310-2EC ID scan & enable (CAN1, 1Mbps classic) ===\r\n");
-	log_print("流程: 扫描0x00~0x7F找电机真实ID -> 清错误 -> 使能 -> 轮询\r\n");
-	log_print("观察电机灯: 常亮红=失能正常 绿=使能成功 闪烁红=有故障码(看[PARAM])\r\n");
+	log_print("Flow: scan ESC_ID -> learn MST_ID -> speed mode -> wait for DBUS arm\r\n");
+	log_print("DM LED: red=disabled, green=enabled, flashing red=fault\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  /* ===== 安全保持模式：使能 + 100Hz零扭矩 + 遥测解码 =====
-   * 已破案：电机ID=0x000，曾被故障闩死；FF×7+FB/FC 全填充格式有效。
-   * 本循环每10ms发一帧MIT零扭矩（kp=kd=0、t_ff=0且按映射编码到0x7FF，
-   * 注意MIT帧全零字节≠零扭矩，t_ff原始0会映射成-10Nm！），这同时
-   * 触发电机每帧回反馈 → 解码出位置/速度/扭矩/双温度打印。 */
-	/* MIT速度控制帧：p=0，v=1.0rad/s，kp=0，kd=0.5，t_ff=0
-	 * 按达妙说明书：kp=0、kd!=0、给定v_des可实现匀速转动。 */
+  /* ===== J4310-2EC 速度模式台架测试 =====
+   * 先扫描ESC_ID并从参数应答学习MST_ID，再切换CTRL_MODE=3。
+   * 使能后每10ms发送一次0x200+ESC_ID的4字节float速度命令，
+   * 同时解析MST_ID反馈中的位置、速度、扭矩和双温度。 */
+	/* 速度模式控制量：v_des单位rad/s，float小端发送。 */
 	uint8_t speed_cmd[4];
-	float speed_target = 1.0f;   /* 目标速度 rad/s，先用低速测试 */
+	float speed_target = 2.0f;    /* 约19rpm，首次台架测试先用低速 */
 	memcpy(speed_cmd, &speed_target, sizeof(speed_cmd));
-	/* ===== 重新扫描电机真实 CAN ID（0x00~0x7F）=====
-	 * 格式/供电/物理层均已确认正确，唯一能解释"读参数无应答+使能无效+反馈全0"
-	 * 的就是 CAN ID 不匹配。逐个候选ID发读参数帧读VBus(0x3C)，能收到0x33应答者
-	 * 即真实ID（应答帧D0/D1回显电机ID，见 dm_reply_canid）。 */
+	/* Preserve the existing DM parameter scan on CAN1 (0x00..0x7F). */
 	can_tx_quiet = 1;
 	uint8_t scanrd[4] = {0, 0, 0x33, 0x3C};
 	uint16_t found_id = 0xFFFF;
@@ -187,46 +181,111 @@ int main(void)
 		scanrd[1] = (uint8_t)(cand >> 8);
 		fdcanx_send_data(&hfdcan1, 0x7FF, scanrd, 4);
 		HAL_Delay(10);
-		if (dm_rx33_flag) { found_id = cand; break; }
+		/* 0x33应答的CAN帧ID是MST_ID；真正的ESC_ID在D0/D1回显。 */
+		if (dm_rx33_flag && dm_reply_rid == 0x3C && dm_reply_canid == cand)
+		{
+			found_id = cand;
+			break;
+		}
 	}
 	can_tx_quiet = 0;
 	if (found_id != 0xFFFF)
-		log_print("[SCAN] 命中电机真实ID=0x%03X（应答回显=0x%03X）\r\n",
-		          found_id, dm_reply_canid);
-	else
-		log_print("[SCAN] 0x00~0x7F 全无0x33应答（电机不在线 or MasterID≠0x10 or 读参数走不通）\r\n");
-
-	/* 上电顺序：先失能 -> 写CTRL_MODE=3（速度模式） -> 再使能 */
-	uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
-	fdcanx_send_data(&hfdcan1, MOTOR_ID, dis, 8);
-	HAL_Delay(100);
-
-	/* 0x0A = CTRL_MODE，写入3表示速度模式。该操作立即生效，但不保存到Flash。 */
-	dm_set_mode(3);
-	log_print("[MODE] CTRL_MODE=3，已切换到速度模式\r\n");
-	HAL_Delay(100);
-
-	uint8_t en[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
-	fdcanx_send_data(&hfdcan1, MOTOR_ID, en, 8);
-	log_print("[EN] 电机ID=0x%03X 已使能，目标速度=%.2f rad/s\r\n", MOTOR_ID, speed_target);
-
-	/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
-	 * 手册读参数帧只有4字节(D0=CANID_L,D1=CANID_H,D2=0x33,D3=RID)，发8字节DLC不匹配电机不响应 */
-	uint8_t rd[4] = {0, 0, 0x33, 0};
-	uint8_t rids[] = {0x10, 0x3C, 0x3E};  /* NPP极对数(应=14)/VBus电压/Tmtr线圈温度 */
-	for (uint8_t i = 0; i < sizeof(rids); i++)
 	{
-		rd[3] = rids[i];
-		fdcanx_send_data(&hfdcan1, 0x7FF, rd, 4);
-		HAL_Delay(80);   /* 等应答帧(问询式，发一帧回一帧) */
+		dm_motor_id = found_id;
+		log_print("[SCAN] ESC_ID=0x%03X MST_ID=0x%03X\r\n",
+		          dm_motor_id, dm_master_id);
+	}
+	else
+	{
+		log_print("[SCAN] No valid DM reply in 0x00..0x7F; skip DM enable.\r\n");
+		log_print("[CAN1] DM absent; CAN2 C620 test remains available.\r\n");
 	}
 
+	if (found_id != 0xFFFF)
+	{
+		/* 上电顺序：先失能 -> 写CTRL_MODE=3（速度模式） -> 再使能 */
+		uint8_t dis[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+		fdcanx_send_data(&hfdcan1, dm_motor_id, dis, 8);
+		HAL_Delay(100);
+
+		/* 0x0A = CTRL_MODE，写入3表示速度模式。该操作立即生效，但不保存到Flash。 */
+		dm_set_mode(3);
+		log_print("[MODE] Requested CTRL_MODE=3 (speed).\r\n");
+		HAL_Delay(100);
+
+		log_print("[EN] Waiting for DBUS S1=%u before enabling ESC_ID=0x%03X.\r\n",
+		          (unsigned)DBUS_ARM_S1_VALUE, dm_motor_id);
+
+		/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
+		 * 手册读参数帧只有4字节(D0=CANID_L,D1=CANID_H,D2=0x33,D3=RID)，发8字节DLC不匹配电机不响应 */
+		uint8_t rd[4] = {
+			(uint8_t)(dm_motor_id & 0xFF),
+			(uint8_t)(dm_motor_id >> 8),
+			0x33,
+			0
+		};
+		uint8_t rids[] = {0x07, 0x10, 0x3C, 0x3E};  /* MST_ID/NPP/VBus/Tmtr */
+		for (uint8_t i = 0; i < sizeof(rids); i++)
+		{
+			rd[3] = rids[i];
+			fdcanx_send_data(&hfdcan1, 0x7FF, rd, 4);
+			HAL_Delay(80);   /* 等应答帧(问询式，发一帧回一帧) */
+		}
+
+	} /* DM startup only when CAN1 scan succeeded. */
+
+	log_print("[DJI|CAN2] ID config=%u (0=auto), DBUS-gated target=%ldrpm, current limit=%d.\r\n",
+	          (unsigned)DJI_MOTOR_ID, (long)DJI_DEFAULT_OUTPUT_RPM, DJI_CURRENT_LIMIT);
+	log_print("[DJI|CAN2] Listen 1s for C620 ID; CAN3 reserved.\r\n");
+	can_tx_quiet = 1; /* periodic control must not print a UART line per frame */
+	uint32_t last_dm_command = HAL_GetTick();
+	uint32_t last_dji_log = HAL_GetTick();
+	uint8_t dm_enabled = 0U;
 	while (1)
 	{
-		/* 100Hz速度模式命令：ID=0x200+MOTOR_ID，4字节float，小端 */
-		fdcanx_send_data(&hfdcan1, (uint16_t)(0x200 + MOTOR_ID), speed_cmd, 4);
+		uint32_t now = HAL_GetTick();
+		dbus_data_t rc;
+		dbus_get_data(&rc);
+		uint8_t rc_online = dbus_is_online(now);
+		uint8_t rc_armed = rc_online && dbus_is_armed(&rc);
+		uint8_t friction_on = rc_armed && dbus_friction_enabled(&rc);
+		/* The C620 loop remains closed on CAN2, but cannot arm without DBUS. */
+		dji_run_enable = friction_on;
+		dji_target_output_rpm = friction_on ? DJI_DEFAULT_OUTPUT_RPM : 0.0f;
+		/* One DM motor is currently installed on CAN1. Stick CH1 commands speed;
+		 * center stops it. This is a speed-mode gimbal command, not position mode. */
+		speed_target = rc_armed ? dbus_channel_normalized(&rc, 0U) * 2.0f : 0.0f;
+		memcpy(speed_cmd, &speed_target, sizeof(speed_cmd));
 
-		/* 每秒打印帧计数：看ID=0x10帧是"每MIT帧都回(~100/s)"还是"只来一次" */
+		if (found_id != 0xFFFF && dm_enabled != rc_armed)
+		{
+			dm_enabled = rc_armed;
+			uint8_t command[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+			                     rc_armed ? 0xFC : 0xFD};
+			fdcanx_send_data(&hfdcan1, dm_motor_id, command, 8);
+		}
+		dji_motor_task(now);
+		/* 100Hz速度模式命令：ID=0x200+ESC_ID，4字节float，小端 */
+		if (found_id != 0xFFFF && now - last_dm_command >= 10U)
+		{
+			last_dm_command = now;
+			fdcanx_send_data(&hfdcan1, (uint16_t)(0x200 + dm_motor_id), speed_cmd, 4);
+		}
+		if (now - last_dji_log >= 1000U)
+		{
+			last_dji_log = now;
+			const dji_status_t *dji = dji_motor_status();
+			log_print("[DJI] %s id=%u seen=%02X out=%ldrpm cmd=%d T=%u rx=%lu\r\n",
+			          dji_motor_state_name(dji->state), dji->motor_id, dji->seen_mask,
+			          (long)((float)dji->rotor_rpm / DJI_GEAR_RATIO), dji->current_command,
+			          dji->temperature, (unsigned long)dji->feedback_count);
+			log_print("[RC] %s arm=%u friction=%u S1=%u S2=%u CH0=%d CH1=%d CH2=%d CH3=%d frames=%lu\r\n",
+			          rc_online ? "ONLINE" : "WAIT", rc_armed, friction_on,
+			          rc.s1, rc.s2, rc.channel[0], rc.channel[1], rc.channel[2], rc.channel[3],
+			          (unsigned long)rc.frame_count);
+		}
+
+		/* 每秒打印帧计数：反馈帧ID使用运行时学习到的MST_ID */
 		static uint32_t last_cnt = 0, prev_rx = 0, prev_fb = 0;
 		if ((HAL_GetTick() - last_cnt) >= 1000)
 		{
@@ -235,8 +294,8 @@ int main(void)
 			prev_rx = dm_rx_count;
 			prev_fb = dm_fb_count;
 			last_cnt = HAL_GetTick();
-			log_print("[CNT] rx_total=%lu(+%lu/s) fb_0x10=%lu(+%lu/s)\r\n",
-			          (unsigned long)dm_rx_count, (unsigned long)drx,
+			log_print("[CNT] rx_total=%lu(+%lu/s) fb_mst(0x%03X)=%lu(+%lu/s)\r\n",
+			          (unsigned long)dm_rx_count, (unsigned long)drx, dm_master_id,
 			          (unsigned long)dm_fb_count, (unsigned long)dfb);
 		}
 
@@ -244,25 +303,31 @@ int main(void)
 		static uint32_t last_print = 0;
 		if (dm_fb_new && (HAL_GetTick() - last_print) >= 500)
 		{
+			uint8_t fb[8];
+			uint32_t primask = __get_PRIMASK();
+			__disable_irq();
+			for (unsigned i = 0; i < 8; ++i)
+				fb[i] = dm_fb[i];
 			dm_fb_new = 0;
+			__set_PRIMASK(primask);
 			last_print = HAL_GetTick();
 			log_print("[RAW FB] %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-			          dm_fb[0], dm_fb[1], dm_fb[2], dm_fb[3],
-			          dm_fb[4], dm_fb[5], dm_fb[6], dm_fb[7]);
-			uint8_t err = dm_fb[0] >> 4;
-			int  pos_raw = (dm_fb[1] << 8) | dm_fb[2];
-			int  vel_raw = ((dm_fb[3] & 0xFF) << 4) | (dm_fb[4] >> 4);
-			int  tau_raw = ((dm_fb[4] & 0x0F) << 8) | dm_fb[5];
+			          fb[0], fb[1], fb[2], fb[3],
+			          fb[4], fb[5], fb[6], fb[7]);
+			uint8_t err = fb[0] >> 4;
+			int  pos_raw = (fb[1] << 8) | fb[2];
+			int  vel_raw = ((fb[3] & 0xFF) << 4) | (fb[4] >> 4);
+			int  tau_raw = ((fb[4] & 0x0F) << 8) | fb[5];
 			float pos = u2f(pos_raw, -PMAX_F, PMAX_F, 16);
 			float vel = u2f(vel_raw, -VMAX_F, VMAX_F, 12);
 			float tau = u2f(tau_raw, -TMAX_F, TMAX_F, 12);
 			const char *err_s =
-				(err == 0) ? "失能" : (err == 1) ? "使能" :
-				(err == 3) ? "输出轴校准异常" : (err == 4) ? "传感器输出异常" :
-				(err == 5) ? "电机编码器校准异常" : (err == 8) ? "超压" :
-				(err == 9) ? "欠压" : (err == 0xA) ? "过流" :
-				(err == 0xB) ? "MOS过温" : (err == 0xC) ? "线圈过温" :
-				(err == 0xD) ? "通讯丢失" : (err == 0xE) ? "过载" : "未知";
+				(err == 0) ? "OFF" : (err == 1) ? "ON" :
+				(err == 3) ? "OUT-ENC-CAL" : (err == 4) ? "SENSOR" :
+				(err == 5) ? "MOTOR-ENC-CAL" : (err == 8) ? "OV" :
+				(err == 9) ? "UV" : (err == 0xA) ? "OC" :
+				(err == 0xB) ? "MOS-HOT" : (err == 0xC) ? "COIL-HOT" :
+				(err == 0xD) ? "CAN-TIMEOUT" : (err == 0xE) ? "OVERLOAD" : "UNKNOWN";
 			float ap = (pos < 0) ? -pos : pos;
 			float av = (vel < 0) ? -vel : vel;
 			float at = (tau < 0) ? -tau : tau;
@@ -272,9 +337,9 @@ int main(void)
 			          (pos < 0) ? "-" : "", (unsigned long)ap, (unsigned long)((ap - (int)ap) * 100),
 			          (vel < 0) ? "-" : "", (unsigned long)av, (unsigned long)((av - (int)av) * 100),
 			          (tau < 0) ? "-" : "", (unsigned long)at, (unsigned long)((at - (int)at) * 100),
-			          dm_fb[6], dm_fb[7]);
+			          fb[6], fb[7]);
 		}
-		HAL_Delay(10);
+		HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
