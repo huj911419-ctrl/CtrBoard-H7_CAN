@@ -8,6 +8,9 @@ static volatile uint8_t dm_param_waiting = 0;
 static volatile uint16_t dm_expected_canid = 0xFFFF;
 static volatile uint8_t dm_expected_opcode = 0;
 static volatile uint8_t dm_expected_rid = 0;
+static volatile can_bus_stats_t can1_stats;
+static volatile can_bus_stats_t can2_stats;
+static volatile dm_param_reply_t dm_param_reply;
 
 /**
 ************************************************************************
@@ -102,15 +105,19 @@ uint8_t fdcanx_send_data(hcan_t *hfdcan, uint16_t id, uint8_t *data, uint32_t le
 	}
 
 	uint8_t ok = (HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &pTxHeader, data) == HAL_OK);
+	volatile can_bus_stats_t *stats = (hfdcan == &hfdcan1) ? &can1_stats :
+	                                  (hfdcan == &hfdcan2) ? &can2_stats : NULL;
+	if (stats != NULL) {
+		if (ok)
+			++stats->tx_queue_count;
+		else
+			++stats->tx_fail_count;
+	}
 	if (!ok && is_param_request)
 		dm_param_waiting = 0;
 
 	if (!can_tx_quiet && hfdcan == &hfdcan1)
-	{
-		const char *port = (hfdcan->Instance == FDCAN1) ? "CAN1" :
-		                   (hfdcan->Instance == FDCAN2) ? "CAN2" : "CAN3";
-		can_log(ok ? "TX" : "TX-FAIL", port, (uint16_t)pTxHeader.Identifier, data, (uint8_t)len);
-	}
+		can_log(ok ? "TX" : "TX-FAIL", "CAN1", (uint16_t)pTxHeader.Identifier, data, (uint8_t)len);
 	return ok ? 0 : 1;
 }
 /**
@@ -133,6 +140,10 @@ uint8_t fdcanx_receive(hcan_t *hfdcan, uint16_t *rec_id, uint8_t *buf)
         return 0;
     *rec_id = (uint16_t)header.Identifier;
     memcpy(buf, data, header.DataLength);
+    if (hfdcan == &hfdcan1)
+        ++can1_stats.rx_count;
+    else if (hfdcan == &hfdcan2)
+        ++can2_stats.rx_count;
     return (uint8_t)header.DataLength;
 }
 
@@ -141,7 +152,7 @@ volatile uint8_t dm_rx33_flag = 0;
 volatile uint16_t dm_reply_canid = 0xFFFF;
 volatile uint8_t dm_reply_rid = 0;
 volatile uint16_t dm_master_id = 0xFFFF;  /* 参数应答/状态反馈使用的MST_ID */
-volatile uint8_t can_tx_quiet = 0;        /* =1ʱfdcanx_send_data����ӡTX��־(��ɨ��) */
+volatile uint8_t can_tx_quiet = 1;        /* 默认关闭原始逐帧TX日志，使用主循环规范化诊断 */
 volatile uint32_t dm_rx_count = 0;        /* �յ�����֡����������ID�����"�з�Ӧ"�ã� */
 volatile uint8_t dm_fb[8] = {0};          /* ���һ֡��������ԭ�� */
 volatile uint8_t dm_fb_new = 0;           /* =1��ʾ��δ�����ķ���֡ */
@@ -149,7 +160,7 @@ volatile uint32_t dm_fb_count = 0;        /* MST_ID反馈帧计数 */
 
 /* 达妙参数应答与状态反馈共用MST_ID。
  * 参数应答必须结合当前请求的ESC_ID/opcode/RID匹配，剩余MST_ID帧才按状态反馈处理。 */
-static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, uint8_t len)
+static void motor_frame_process(uint16_t id, const uint8_t *d, uint8_t len)
 {
 	/* 参数应答的CAN帧ID是MST_ID，不应写死成0x10。
 	 * D0/D1回显被访问的ESC_ID，同时匹配当前请求的opcode与RID。 */
@@ -166,39 +177,17 @@ static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, u
 		uint32_t u = (uint32_t)d[4] | ((uint32_t)d[5] << 8)
 		           | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
 
-		if (d[2] == 0x33U)
-		{
+		if (d[2] == 0x33U) {
 			dm_rx33_flag = 1;
-			float f;
-			memcpy(&f, &u, 4);
-
-			if (d[3] == 0x07)          /* MST_ID 反馈ID */
-			{
+			if (d[3] == 0x07U)
 				dm_master_id = (uint16_t)u;
-				log_print("[PARAM|%s] MST_ID = 0x%03X\r\n", port, dm_master_id);
-			}
-			else if (d[3] == 0x3C)     /* VBus 电源电压 */
-			{
-				uint32_t mv = (uint32_t)(f * 100.0f + 0.5f);
-				log_print("[PARAM|%s] VBus = %lu.%02lu V\r\n", port,
-				          (unsigned long)(mv / 100), (unsigned long)(mv % 100));
-			}
-			else if (d[3] == 0x50)     /* p_m 电机当前位置(rad) */
-			{
-				float a = (f < 0) ? -f : f;
-				uint32_t cr = (uint32_t)(a * 100.0f + 0.5f);
-				log_print("[PARAM|%s] p_m = %s%lu.%02lu rad\r\n", port, (f < 0) ? "-" : "",
-				          (unsigned long)(cr / 100), (unsigned long)(cr % 100));
-			}
-			else
-				log_print("[PARAM|%s] RID=0x%02X raw=0x%08lX\r\n",
-				          port, d[3], (unsigned long)u);
 		}
-		else /* 0x55 写参数应答 */
-		{
-			log_print("[PARAM-WR|%s] RID=0x%02X raw=0x%08lX\r\n",
-			          port, d[3], (unsigned long)u);
-		}
+		dm_param_reply.valid = 1U;
+		dm_param_reply.opcode = d[2];
+		dm_param_reply.rid = d[3];
+		dm_param_reply.can_id = echoed_canid;
+		dm_param_reply.mst_id = id;
+		dm_param_reply.raw = u;
 	}
 	else if (id == dm_master_id && len >= 8)
 	{
@@ -209,10 +198,7 @@ static void motor_frame_print(const char *port, uint16_t id, const uint8_t *d, u
 			dm_fb[i] = d[i];
 		dm_fb_new = 1;
 	}
-	else
-	{
-		can_log("RX", port, id, d, len);
-	}
+	/* Other CAN1 frames are counted by can1_stats but never printed from ISR. */
 }
 
 void fdcan1_rx_callback(void)
@@ -222,7 +208,7 @@ void fdcan1_rx_callback(void)
     uint8_t len = fdcanx_receive(&hfdcan1, &id, data);
     if (len != 0U) {
         ++dm_rx_count;
-        motor_frame_print("CAN1", id, data, len);
+        motor_frame_process(id, data, len);
     }
 }
 
@@ -233,6 +219,42 @@ void fdcan2_rx_callback(void)
     uint8_t len = fdcanx_receive(&hfdcan2, &id, data);
     if (len != 0U)
         dji_motor_on_feedback(id, data, len, HAL_GetTick());
+}
+
+void bsp_can_get_stats(hcan_t *hfdcan, can_bus_stats_t *out)
+{
+    if (out == NULL)
+        return;
+    volatile can_bus_stats_t *src = (hfdcan == &hfdcan1) ? &can1_stats :
+                                    (hfdcan == &hfdcan2) ? &can2_stats : NULL;
+    if (src == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    out->rx_count = src->rx_count;
+    out->tx_queue_count = src->tx_queue_count;
+    out->tx_fail_count = src->tx_fail_count;
+}
+
+uint8_t dm_take_param_reply(dm_param_reply_t *out)
+{
+    if (out == NULL)
+        return 0U;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (!dm_param_reply.valid) {
+        __set_PRIMASK(primask);
+        return 0U;
+    }
+    out->valid = dm_param_reply.valid;
+    out->opcode = dm_param_reply.opcode;
+    out->rid = dm_param_reply.rid;
+    out->can_id = dm_param_reply.can_id;
+    out->mst_id = dm_param_reply.mst_id;
+    out->raw = dm_param_reply.raw;
+    dm_param_reply.valid = 0U;
+    __set_PRIMASK(primask);
+    return 1U;
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)

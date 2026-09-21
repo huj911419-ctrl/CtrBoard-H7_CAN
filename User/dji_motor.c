@@ -13,7 +13,9 @@
 #define STALL_TIMEOUT_MS 2000U
 
 typedef struct {
+    uint16_t angle;
     int16_t rpm;
+    int16_t torque_current;
     uint8_t temperature;
     uint32_t count;
     uint32_t last_rx;
@@ -42,7 +44,9 @@ static float magnitude(float x)
 void dji_motor_init(uint32_t now)
 {
     for (unsigned i = 0; i < 8; ++i) {
+        feedback[i].angle = 0;
         feedback[i].rpm = 0;
+        feedback[i].torque_current = 0;
         feedback[i].temperature = 0;
         feedback[i].count = 0;
         feedback[i].last_rx = 0;
@@ -64,8 +68,11 @@ void dji_motor_on_feedback(uint16_t id, const uint8_t *data, uint8_t len, uint32
     if ((((uint32_t)data[0] << 8) | data[1]) > 8191U)
         return;
     unsigned slot = id - 0x201U;
-    uint16_t raw = ((uint16_t)data[2] << 8) | data[3];
-    feedback[slot].rpm = (int16_t)(raw < 0x8000U ? (int32_t)raw : (int32_t)raw - 65536);
+    feedback[slot].angle = ((uint16_t)data[0] << 8) | data[1];
+    uint16_t raw_rpm = ((uint16_t)data[2] << 8) | data[3];
+    uint16_t raw_current = ((uint16_t)data[4] << 8) | data[5];
+    feedback[slot].rpm = (int16_t)(raw_rpm < 0x8000U ? (int32_t)raw_rpm : (int32_t)raw_rpm - 65536);
+    feedback[slot].torque_current = (int16_t)(raw_current < 0x8000U ? (int32_t)raw_current : (int32_t)raw_current - 65536);
     feedback[slot].temperature = data[6];
     feedback[slot].last_rx = now;
     if (feedback[slot].count != UINT32_MAX)
@@ -112,7 +119,9 @@ void dji_motor_task(uint32_t now)
     uint32_t snapshot_time = HAL_GetTick();
     status.seen_mask = seen_mask;
     for (unsigned i = 0; i < 8; ++i) {
+        samples[i].angle = feedback[i].angle;
         samples[i].rpm = feedback[i].rpm;
+        samples[i].torque_current = feedback[i].torque_current;
         samples[i].temperature = feedback[i].temperature;
         samples[i].count = feedback[i].count;
         samples[i].last_rx = feedback[i].last_rx;
@@ -147,8 +156,11 @@ void dji_motor_task(uint32_t now)
 
     if (status.motor_id != 0U) {
         feedback_t *sample = &samples[status.motor_id - 1U];
+        status.rotor_angle = sample->angle;
         status.rotor_rpm = sample->rpm;
+        status.torque_current = sample->torque_current;
         status.temperature = sample->temperature;
+        status.feedback_age_ms = snapshot_time - sample->last_rx;
         status.feedback_count = sample->count;
         if (status.state < DJI_FAULT_MULTIPLE) {
             if (snapshot_time - sample->last_rx > DJI_FEEDBACK_TIMEOUT_MS)

@@ -36,8 +36,11 @@ typedef struct {
     uint8_t motor_id;
     uint8_t seen_mask;
     uint8_t temperature;
+    uint16_t rotor_angle;
     int16_t rotor_rpm;
+    int16_t torque_current;
     int16_t current_command;
+    uint32_t feedback_age_ms;
     uint32_t feedback_count;
 } dji_status_t;
 

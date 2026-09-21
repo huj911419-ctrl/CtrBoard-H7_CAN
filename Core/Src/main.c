@@ -42,6 +42,9 @@
 /* Learning switch: keep DBUS reception/logging active, but disconnect it from
  * both motors. Set to 1 later when remote motor control is needed again. */
 #define REMOTE_MOTOR_CONTROL_ENABLE  0
+#define LOG_RC_PERIOD_MS             200U
+#define LOG_MOTOR_PERIOD_MS          500U
+#define LOG_CAN_PERIOD_MS           1000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -94,6 +97,67 @@ static void dm_write_u32_param(uint32_t value, uint8_t rid)
 static void dm_set_mode(uint32_t mode)
 {
 	dm_write_u32_param(mode, 0x0A);
+}
+
+static const char *dm_state_name(uint8_t err)
+{
+	return (err == 0x0U) ? "OFF" : (err == 0x1U) ? "ON" :
+	       (err == 0x3U) ? "OUT-ENC-CAL" : (err == 0x4U) ? "SENSOR" :
+	       (err == 0x5U) ? "MOTOR-ENC-CAL" : (err == 0x8U) ? "OV" :
+	       (err == 0x9U) ? "UV" : (err == 0xAU) ? "OC" :
+	       (err == 0xBU) ? "MOS-HOT" : (err == 0xCU) ? "COIL-HOT" :
+	       (err == 0xDU) ? "CAN-TIMEOUT" : (err == 0xEU) ? "OVERLOAD" : "UNKNOWN";
+}
+
+static void dm_log_param_reply(void)
+{
+	dm_param_reply_t reply;
+	if (!dm_take_param_reply(&reply))
+		return;
+
+	if (reply.opcode == 0x55U) {
+		log_print("[DM][PARAM-WR] id=0x%03X rid=0x%02X raw=0x%08lX\r\n",
+		          reply.can_id, reply.rid, (unsigned long)reply.raw);
+		return;
+	}
+
+	if (reply.rid == 0x07U) {
+		log_print("[DM][PARAM] MST_ID=0x%03lX\r\n", (unsigned long)reply.raw);
+	} else if (reply.rid == 0x3CU) {
+		float f;
+		memcpy(&f, &reply.raw, sizeof(f));
+		float a = f < 0.0f ? -f : f;
+		uint32_t centi = (uint32_t)(a * 100.0f + 0.5f);
+		log_print("[DM][PARAM] VBus=%s%lu.%02luV\r\n", f < 0.0f ? "-" : "",
+		          (unsigned long)(centi / 100U), (unsigned long)(centi % 100U));
+	} else {
+		log_print("[DM][PARAM] rid=0x%02X raw=0x%08lX\r\n",
+		          reply.rid, (unsigned long)reply.raw);
+	}
+}
+
+static void log_can_health(const char *name, FDCAN_HandleTypeDef *hfdcan,
+                           can_bus_stats_t *previous)
+{
+	can_bus_stats_t now_stats;
+	FDCAN_ProtocolStatusTypeDef protocol;
+	FDCAN_ErrorCountersTypeDef errors;
+	bsp_can_get_stats(hfdcan, &now_stats);
+	if (HAL_FDCAN_GetProtocolStatus(hfdcan, &protocol) != HAL_OK ||
+	    HAL_FDCAN_GetErrorCounters(hfdcan, &errors) != HAL_OK) {
+		log_print("[%s] health=READ-ERROR\r\n", name);
+		*previous = now_stats;
+		return;
+	}
+	log_print("[%s] rx=%lu/s txq=%lu/s fail=%lu TEC=%lu REC=%lu BO=%lu EP=%lu LEC=%lu\r\n",
+	          name,
+	          (unsigned long)(now_stats.rx_count - previous->rx_count),
+	          (unsigned long)(now_stats.tx_queue_count - previous->tx_queue_count),
+	          (unsigned long)(now_stats.tx_fail_count - previous->tx_fail_count),
+	          (unsigned long)errors.TxErrorCnt, (unsigned long)errors.RxErrorCnt,
+	          (unsigned long)protocol.BusOff, (unsigned long)protocol.ErrorPassive,
+	          (unsigned long)protocol.LastErrorCode);
+	*previous = now_stats;
 }
 /* USER CODE END 0 */
 
@@ -157,9 +221,15 @@ int main(void)
 	bsp_can_init();             /* CAN1=DM, CAN2=C620, CAN3 reserved */
 	HAL_Delay(100);
 
-	log_print("\r\n=== DM-J4310-2EC ID scan & enable (CAN1, 1Mbps classic) ===\r\n");
-	log_print("Flow: scan ESC_ID -> learn MST_ID -> speed mode -> wait for DBUS arm\r\n");
-	log_print("DM LED: red=disabled, green=enabled, flashing red=fault\r\n");
+	log_print("\r\n[BOOT] CtrBoard-H7 diagnostics online\r\n");
+	log_print("[CFG] UART10=115200 log; UART7=DBUS 100k inverted RX\r\n");
+	log_print("[CFG] CAN1=1Mbps Classic DM-J4310 ctrl=SPEED cmd=0x200+ID(v_des)\r\n");
+	log_print("[CFG] CAN2=1Mbps Classic C620 cmd=0x200/0x1FF(current), speed loop=MCU PI\r\n");
+#if REMOTE_MOTOR_CONTROL_ENABLE
+	log_print("[CFG] RC motor_control=ON\r\n");
+#else
+	log_print("[CFG] RC motor_control=OFF (receive/log only)\r\n");
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -190,17 +260,17 @@ int main(void)
 			break;
 		}
 	}
-	can_tx_quiet = 0;
+	can_tx_quiet = 1;
 	if (found_id != 0xFFFF)
 	{
 		dm_motor_id = found_id;
-		log_print("[SCAN] ESC_ID=0x%03X MST_ID=0x%03X\r\n",
+		dm_log_param_reply();
+		log_print("[DM][SCAN] ESC_ID=0x%03X MST_ID=0x%03X result=OK\r\n",
 		          dm_motor_id, dm_master_id);
 	}
 	else
 	{
-		log_print("[SCAN] No valid DM reply in 0x00..0x7F; skip DM enable.\r\n");
-		log_print("[CAN1] DM absent; CAN2 C620 test remains available.\r\n");
+		log_print("[DM][SCAN] ESC_ID=NONE range=0x00..0x7F result=TIMEOUT\r\n");
 	}
 
 	if (found_id != 0xFFFF)
@@ -213,14 +283,13 @@ int main(void)
 
 		/* 0x0A = CTRL_MODE，写入3表示速度模式。该操作立即生效，但不保存到Flash。 */
 		dm_set_mode(3);
-		log_print("[MODE] Requested CTRL_MODE=3 (speed).\r\n");
 		HAL_Delay(100);
-
+		dm_log_param_reply();
 #if REMOTE_MOTOR_CONTROL_ENABLE
-		log_print("[EN] Waiting for DBUS S1=%u before enabling ESC_ID=0x%03X.\r\n",
-		          (unsigned)DBUS_ARM_S1_VALUE, dm_motor_id);
+		log_print("[DM][CFG] ctrl=SPEED enable=DBUS-S1(%u)\r\n",
+		          (unsigned)DBUS_ARM_S1_VALUE);
 #else
-		log_print("[EN] Remote motor control disabled; DM remains disabled.\r\n");
+		log_print("[DM][CFG] ctrl=SPEED enable=OFF target=0rad/s\r\n");
 #endif
 
 		/* 读参数诊断：读必非0的寄存器，客观验证通信+供电+存活（不依赖灯色）。
@@ -237,21 +306,26 @@ int main(void)
 			rd[3] = rids[i];
 			fdcanx_send_data(&hfdcan1, 0x7FF, rd, 4);
 			HAL_Delay(80);   /* 等应答帧(问询式，发一帧回一帧) */
+			dm_log_param_reply();
 		}
 
 	} /* DM startup only when CAN1 scan succeeded. */
 
-	log_print("[DJI|CAN2] ID config=%u (0=auto), default target=%ldrpm, current limit=%d.\r\n",
+	log_print("[DJI][CFG] id=%u(0=auto) target=%ldrpm limit=%d CAN-units\r\n",
 	          (unsigned)DJI_MOTOR_ID, (long)DJI_DEFAULT_OUTPUT_RPM, DJI_CURRENT_LIMIT);
-#if REMOTE_MOTOR_CONTROL_ENABLE
-	log_print("[RC] Motor control ENABLED: S1 arms DM, S2 gates C620.\r\n");
-#else
-	log_print("[RC] Motor control DISABLED: DBUS receive/log only; motors stay safe.\r\n");
-#endif
-	log_print("[DJI|CAN2] Listen 1s for C620 ID; CAN3 reserved.\r\n");
-	can_tx_quiet = 1; /* periodic control must not print a UART line per frame */
+	log_print("[CFG] CAN3=RESERVED; raw CAN frame logging=OFF\r\n");
+	can_tx_quiet = 1;
 	uint32_t last_dm_command = HAL_GetTick();
-	uint32_t last_dji_log = HAL_GetTick();
+	uint32_t last_rc_log = 0U;
+	uint32_t last_dji_log = 0U;
+	uint32_t last_dm_log = 0U;
+	uint32_t last_can_log = 0U;
+	can_bus_stats_t can1_prev = {0}, can2_prev = {0};
+	bsp_can_get_stats(&hfdcan1, &can1_prev);
+	bsp_can_get_stats(&hfdcan2, &can2_prev);
+	uint8_t last_rc_online = 2U;
+	dji_state_t last_dji_state = DJI_WAITING;
+	uint8_t last_dm_err = 0xFFU;
 #if REMOTE_MOTOR_CONTROL_ENABLE
 	uint8_t dm_enabled = 0U;
 #endif
@@ -291,37 +365,43 @@ int main(void)
 			last_dm_command = now;
 			fdcanx_send_data(&hfdcan1, (uint16_t)(0x200 + dm_motor_id), speed_cmd, 4);
 		}
-		if (now - last_dji_log >= 1000U)
-		{
-			last_dji_log = now;
-			const dji_status_t *dji = dji_motor_status();
-			log_print("[DJI] %s id=%u seen=%02X out=%ldrpm cmd=%d T=%u rx=%lu\r\n",
-			          dji_motor_state_name(dji->state), dji->motor_id, dji->seen_mask,
-			          (long)((float)dji->rotor_rpm / DJI_GEAR_RATIO), dji->current_command,
-			          dji->temperature, (unsigned long)dji->feedback_count);
-			log_print("[RC] %s arm=%u friction=%u S1=%u S2=%u CH0=%d CH1=%d CH2=%d CH3=%d frames=%lu\r\n",
-			          rc_online ? "ONLINE" : "WAIT", rc_armed, friction_on,
+		const dji_status_t *dji = dji_motor_status();
+		if (rc_online != last_rc_online) {
+			log_print("[EVENT][RC] link=%s\r\n", rc_online ? "ONLINE" : "OFFLINE");
+			last_rc_online = rc_online;
+		}
+		if (dji->state != last_dji_state) {
+			log_print("[EVENT][DJI] state=%s->%s\r\n",
+			          dji_motor_state_name(last_dji_state), dji_motor_state_name(dji->state));
+			last_dji_state = dji->state;
+		}
+
+		if (now - last_rc_log >= LOG_RC_PERIOD_MS) {
+			last_rc_log = now;
+			log_print("[RC] link=%s ctrl=%s arm=%u fire=%u s1=%u s2=%u ch=%d,%d,%d,%d frames=%lu\r\n",
+			          rc_online ? "ON" : "OFF",
+			          REMOTE_MOTOR_CONTROL_ENABLE ? "ON" : "OFF", rc_armed, friction_on,
 			          rc.s1, rc.s2, rc.channel[0], rc.channel[1], rc.channel[2], rc.channel[3],
 			          (unsigned long)rc.frame_count);
 		}
 
-		/* 每秒打印帧计数：反馈帧ID使用运行时学习到的MST_ID */
-		static uint32_t last_cnt = 0, prev_rx = 0, prev_fb = 0;
-		if ((HAL_GetTick() - last_cnt) >= 1000)
-		{
-			uint32_t drx = dm_rx_count - prev_rx;
-			uint32_t dfb = dm_fb_count - prev_fb;
-			prev_rx = dm_rx_count;
-			prev_fb = dm_fb_count;
-			last_cnt = HAL_GetTick();
-			log_print("[CNT] rx_total=%lu(+%lu/s) fb_mst(0x%03X)=%lu(+%lu/s)\r\n",
-			          (unsigned long)dm_rx_count, (unsigned long)drx, dm_master_id,
-			          (unsigned long)dm_fb_count, (unsigned long)dfb);
+		else if (now - last_dji_log >= LOG_MOTOR_PERIOD_MS) {
+			last_dji_log = now;
+			log_print("[DJI] st=%s id=%u ecd=%u rpm=%d out=%ld iq_fb=%d iq_cmd=%d T=%u age=%lums rx=%lu\r\n",
+			          dji_motor_state_name(dji->state), dji->motor_id, dji->rotor_angle,
+			          dji->rotor_rpm, (long)((float)dji->rotor_rpm / DJI_GEAR_RATIO),
+			          dji->torque_current, dji->current_command, dji->temperature,
+			          (unsigned long)dji->feedback_age_ms, (unsigned long)dji->feedback_count);
 		}
 
-		/* 解码最新反馈帧（ERR/位置/速度/扭矩/双温度），2Hz打印 */
-		static uint32_t last_print = 0;
-		if (dm_fb_new && (HAL_GetTick() - last_print) >= 500)
+		else if (now - last_can_log >= LOG_CAN_PERIOD_MS) {
+			last_can_log = now;
+			log_can_health("CAN1", &hfdcan1, &can1_prev);
+			log_can_health("CAN2", &hfdcan2, &can2_prev);
+		}
+
+		/* DM反馈只在主循环中解码/打印，避免在CAN中断里阻塞串口。 */
+		else if (dm_fb_new && (now - last_dm_log) >= LOG_MOTOR_PERIOD_MS)
 		{
 			uint8_t fb[8];
 			uint32_t primask = __get_PRIMASK();
@@ -330,10 +410,7 @@ int main(void)
 				fb[i] = dm_fb[i];
 			dm_fb_new = 0;
 			__set_PRIMASK(primask);
-			last_print = HAL_GetTick();
-			log_print("[RAW FB] %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-			          fb[0], fb[1], fb[2], fb[3],
-			          fb[4], fb[5], fb[6], fb[7]);
+			last_dm_log = now;
 			uint8_t err = fb[0] >> 4;
 			int  pos_raw = (fb[1] << 8) | fb[2];
 			int  vel_raw = ((fb[3] & 0xFF) << 4) | (fb[4] >> 4);
@@ -341,19 +418,16 @@ int main(void)
 			float pos = u2f(pos_raw, -PMAX_F, PMAX_F, 16);
 			float vel = u2f(vel_raw, -VMAX_F, VMAX_F, 12);
 			float tau = u2f(tau_raw, -TMAX_F, TMAX_F, 12);
-			const char *err_s =
-				(err == 0) ? "OFF" : (err == 1) ? "ON" :
-				(err == 3) ? "OUT-ENC-CAL" : (err == 4) ? "SENSOR" :
-				(err == 5) ? "MOTOR-ENC-CAL" : (err == 8) ? "OV" :
-				(err == 9) ? "UV" : (err == 0xA) ? "OC" :
-				(err == 0xB) ? "MOS-HOT" : (err == 0xC) ? "COIL-HOT" :
-				(err == 0xD) ? "CAN-TIMEOUT" : (err == 0xE) ? "OVERLOAD" : "UNKNOWN";
+			const char *err_s = dm_state_name(err);
 			float ap = (pos < 0) ? -pos : pos;
 			float av = (vel < 0) ? -vel : vel;
 			float at = (tau < 0) ? -tau : tau;
-			log_print("[FB] ERR=%X(%s) pos=%s%lu.%02lurad spd=%s%lu.%02lurad/s "
-			          "tau=%s%lu.%02luNm T_MOS=%uC T_Rotor=%uC\r\n",
-			          err, err_s,
+			if (err != last_dm_err) {
+				log_print("[EVENT][DM] state=%s err=0x%X\r\n", err_s, err);
+				last_dm_err = err;
+			}
+			log_print("[DM] st=%s id=0x%03X mst=0x%03X pos=%s%lu.%02lu vel=%s%lu.%02lu tau=%s%lu.%02lu T=%u/%u\r\n",
+			          err_s, dm_motor_id, dm_master_id,
 			          (pos < 0) ? "-" : "", (unsigned long)ap, (unsigned long)((ap - (int)ap) * 100),
 			          (vel < 0) ? "-" : "", (unsigned long)av, (unsigned long)((av - (int)av) * 100),
 			          (tau < 0) ? "-" : "", (unsigned long)at, (unsigned long)((at - (int)at) * 100),
@@ -426,13 +500,11 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* 极简串口日志：vsnprintf 格式化后阻塞发送到 USART10（PE3，115200）。
- * 学习阶段够用；注意两点（以后进阶再改）：
- * 1) 阻塞发送会占住CPU（一行约40字符≈3.5ms）；
- * 2) 在中断回调里打印属于学习用法，正式工程应改为中断/DMA发送。 */
+/* 规范化诊断串口：USART10/115200，所有周期日志都从主循环发送。
+ * CAN RX ISR只解析/计数，不做串口阻塞打印。后续数据量继续增大时再升级DMA日志。 */
 void log_print(const char *fmt, ...)
 {
-	char buf[96];
+	char buf[192];
 	va_list ap;
 	va_start(ap, fmt);
 	int n = vsnprintf(buf, sizeof(buf), fmt, ap);

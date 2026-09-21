@@ -130,7 +130,12 @@ int main(void)
     assert(log_count == 0); /* no UART from CAN2's ISR */
     inject(1, 0x10, response, 8, 1);
     assert(dm_rx33_flag && dm_reply_canid == 7 && dm_master_id == 0x10);
-    assert(dm_rx_count == 1);
+    assert(dm_rx_count == 1 && log_count == 0); /* CAN ISR must stay UART-free */
+    dm_param_reply_t reply;
+    assert(dm_take_param_reply(&reply));
+    assert(reply.opcode == 0x33 && reply.rid == 0x3C && reply.can_id == 7 && reply.mst_id == 0x10);
+    assert(reply.raw == 0x41C00000U);
+    assert(!dm_take_param_reply(&reply));
     uint8_t dm_state[8] = {0x17, 0x80, 0, 0x80, 0, 0, 25, 26};
     inject(1, 0x10, dm_state, 8, 1);
     assert(dm_fb_count == 1 && dm_fb[7] == 26);
@@ -155,6 +160,7 @@ int main(void)
         reset_at(0); discover(id);
         assert(dji_motor_status()->current_command > 0);
         assert(dji_motor_status()->current_command < 100); /* ramp starts gently */
+        assert(dji_motor_status()->rotor_angle == 4096 && dji_motor_status()->torque_current == 0);
         assert_payload(id);
         for (unsigned n = 0; n < 100; ++n) {
             step(id, 0, 25);
